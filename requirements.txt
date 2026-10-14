@@ -1,0 +1,10 @@
+sentence-transformers>=6.1
+torch>=2.14
+numpy
+rank_bm25
+kagglehub
+datasets
+bm25s
+PyStemmer
+pypdf
+python-docx

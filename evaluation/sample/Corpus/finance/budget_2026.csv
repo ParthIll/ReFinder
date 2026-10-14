@@ -1,0 +1,24 @@
+category,type,monthly_budget,jan_actual,feb_actual,mar_actual,notes
+Mortgage,fixed,2310,2310,2310,2310,includes escrow
+Electric,utility,120,164,151,118,heat pump in winter
+Gas,utility,60,92,85,61,
+Water/Sewer,utility,75,72,72,74,
+Internet,utility,70,70,70,70,
+Phones,utility,95,95,95,95,family plan
+Groceries,variable,850,912,803,876,costco trips skew it
+Dining out,variable,250,318,207,295,cut back!!
+Coffee shops,variable,40,58,44,61,
+Gas (car),variable,180,166,171,159,
+Car insurance,fixed,142,142,142,142,
+Car maintenance,sinking fund,50,0,0,389,new tires in March
+Cat (food+vet),variable,85,62,71,240,Biscuit thyroid bloodwork
+Streaming,fixed,48,48,48,48,cancel one of them?
+Gym,fixed,45,45,45,45,
+Clothing,variable,100,35,140,60,
+Gifts,variable,75,40,150,30,feb = birthdays
+Home repairs,sinking fund,200,0,1240,0,roof invoice paid from this fund
+Travel fund,savings,300,300,300,300,portugal!
+Emergency fund,savings,400,400,400,400,goal 6 months
+Retirement (extra),savings,250,250,250,250,on top of 401k
+Estimated taxes,fixed,0,0,0,1200,started quarterly payments per Carla
+Misc,variable,100,87,131,64,

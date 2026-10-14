@@ -1,0 +1,23 @@
+Jordan Reyes
+jreyes.example@university.edu
+
+February 14
+
+City of Port Hallam
+Department of Transportation — Mobility Planning Division
+Attn: Gregory Tan, Senior Planner
+
+Dear Mr. Tan,
+
+Please accept this letter as my application for the Summer Transportation Planning Intern role. I am a sophomore majoring in computer science with a strong interest in how cities move people around, and I have been a daily bus rider for my entire life — I didn't get a driver's license until last year, so routes 12 and 40 basically raised me.
+
+That experience is part of why this internship appeals to me. Riding the same lines every day, I noticed patterns that never seemed to make it onto the official schedules: the 7:50 bus that was reliably eleven minutes late because of the school drop-off traffic on Fremont Avenue, or the stop near the community college where forty people would wait in the rain with no shelter. In my urban geography class last semester, I turned that frustration into a project, mapping missing bus shelters against ridership data from the city's open data portal. My professor encouraged me to send it to the city, which is how I learned about this program.
+
+I understand that interns this summer will help with the bike lane counts and with outreach for the Fremont corridor redesign. I'm comfortable doing field counts at 6am, entering data carefully, and making simple maps in QGIS. I also speak Spanish fluently, which I think could help at community meetings in the east side neighborhoods, where many residents are more comfortable in Spanish and are often left out of planning conversations.
+
+I care about this work because transportation decisions shape who can reach a good job, a doctor, or a grocery store. I would be grateful for the chance to learn from your team and contribute to making Port Hallam easier to get around without a car.
+
+Thank you for your time and consideration. I am available from late May through mid-August.
+
+Sincerely,
+Jordan Reyes
