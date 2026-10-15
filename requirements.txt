@@ -1,6 +1,8 @@
 sentence-transformers>=6.1
 torch>=2.14
 numpy
+fastapi
+uvicorn
 rank_bm25
 kagglehub
 datasets
