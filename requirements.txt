@@ -10,3 +10,4 @@ bm25s
 PyStemmer
 pypdf
 python-docx
+chromadb

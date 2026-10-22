@@ -2,9 +2,6 @@
 from pathlib import Path
 from typing import Any
 
-# NumPy is used to sort similarity scores.
-import numpy as np
-
 # FastAPI creates the API.
 # HTTPException returns clear API errors.
 # Query adds validation to URL query parameters.
@@ -12,6 +9,8 @@ from fastapi import FastAPI, HTTPException, Query
 
 # BaseModel describes the shape of incoming and outgoing JSON.
 from pydantic import BaseModel
+
+from evaluation.database import ChromaIndex
 
 # ---------------------------------------------------------
 # Request and response models
@@ -73,11 +72,36 @@ paths: list[str] = []
 # texts[0] belongs to paths[0], and so on.
 texts: list[str] = []
 
-# Search system containing the model and document vectors.
-retriever: Any | None = None
+# Persistent Chroma store. Survives process restarts.
+store = ChromaIndex()
+
+# Embedding model used to encode queries. Loaded on first index or search.
+embedder: Any | None = None
 
 # Current state of the indexing process.
 index_state = "idle"
+
+
+def _restore_from_disk() -> None:
+    """Reload paths and texts from a previously written Chroma index."""
+    global corpus_root, paths, texts
+    loaded = store.load()
+    if loaded is None:
+        return
+    corpus_root, paths, texts = loaded
+
+
+def _get_embedder():
+    """Load the sentence-transformer only when indexing or searching needs it."""
+    global embedder
+    if embedder is None:
+        from refinder.embedder import DEFAULT_MODEL, Embedder
+
+        embedder = Embedder(store.model_name() or DEFAULT_MODEL)
+    return embedder
+
+
+_restore_from_disk()
 
 
 # ---------------------------------------------------------
@@ -89,12 +113,10 @@ index_state = "idle"
 @app.post("/index", response_model=IndexResponse)
 def index_folder(request: IndexRequest) -> IndexResponse:
     # We assign new values to these module-level variables.
-    global corpus_root, paths, texts, retriever, index_state
+    global corpus_root, paths, texts, index_state
 
-    # Import the ML stack only when indexing is requested. This keeps server
-    # startup and the API docs available even while model dependencies load.
-    from evaluation.custom import DenseRetriever, load_corpus
-    from refinder.embedder import DEFAULT_MODEL
+    # Import extraction only when indexing is requested.
+    from evaluation.custom import load_corpus
 
     # Convert the provided folder into a complete absolute path.
     # expanduser() supports paths beginning with "~".
@@ -124,18 +146,13 @@ def index_folder(request: IndexRequest) -> IndexResponse:
                 detail="Folder contains no supported files",
             )
 
-        # Split the documents into chunks and create embeddings.
-        new_retriever = DenseRetriever(
-            DEFAULT_MODEL,
-            new_texts,
-            use_cache=True,
-        )
+        # Chunk, embed, and persist vectors in ChromaDB.
+        store.replace(folder, new_paths, new_texts, _get_embedder())
 
-        # Save the completed index in server memory.
+        # Keep extracted text in memory for /file and /status.
         corpus_root = folder
         paths = new_paths
         texts = new_texts
-        retriever = new_retriever
 
     finally:
         # Return to idle whether indexing succeeds or fails.
@@ -165,51 +182,24 @@ def search(
 ) -> SearchResponse:
 
     # Searching is impossible before a folder is indexed.
-    if retriever is None:
+    if not store.ready():
         raise HTTPException(
             status_code=409,
             detail="Index a folder before searching",
         )
 
-    # Convert the user's query into an embedding vector.
-    query_vector = retriever.embedder.encode_query(q)
-
-    # score() expects multiple query vectors.
-    # [None] wraps our one vector inside a batch.
-    # [0] gets the score results for that one query.
-    scores = retriever.score(query_vector[None])[0]
-
-    # Ignore files that do not have a valid score.
-    valid_indices = np.flatnonzero(np.isfinite(scores))
-
-    # Sort valid file indexes from highest score to lowest.
-    # [:k] keeps only the best k results.
-    ranked_indices = valid_indices[
-        np.argsort(-scores[valid_indices])
-    ][:k]
-
-    # This list will hold the formatted search results.
-    results = []
-
-    # Turn each matching file into a SearchResult.
-    for index in ranked_indices:
-        # Use the first 300 characters as a preview.
-        # Replacing line breaks makes the preview easier to display.
-        snippet = texts[index].replace("\n", " ")[:300]
-
-        results.append(
+    hits = store.search(_get_embedder().encode_query(q), k=k)
+    return SearchResponse(
+        results=[
             SearchResult(
-                path=paths[index],
-                score=float(scores[index]),
-                snippet=snippet,
-
-                # The current retriever ranks files rather than
-                # returning the exact matching chunk.
-                chunk_id=None,
+                path=hit["path"],
+                score=float(hit["score"]),
+                snippet=hit["snippet"],
+                chunk_id=hit["chunk_id"],
             )
-        )
-
-    return SearchResponse(results=results)
+            for hit in hits
+        ]
+    )
 
 
 # ---------------------------------------------------------
@@ -220,13 +210,9 @@ def search(
 # GET /status
 @app.get("/status", response_model=StatusResponse)
 def status() -> StatusResponse:
-    # Each stored vector represents one document chunk.
-    # If there is no retriever, there are zero chunks.
-    chunk_count = len(retriever.vecs) if retriever else 0
-
     return StatusResponse(
         indexed_files=len(paths),
-        chunks=chunk_count,
+        chunks=store.count(),
         state=index_state,
     )
 
