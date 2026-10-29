@@ -1,0 +1,4 @@
+mcp<2
+httpx
+fastapi
+uvicorn

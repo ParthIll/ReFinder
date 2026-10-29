@@ -90,3 +90,35 @@ On the team corpus (Oct 2026): pruning at beam 4 matched flat accuracy while sco
 latency gain at this size (query encoding dominates). Boost 0.5 raised Qwen3-0.6B Hit@1 from 0.571 to 0.601 and helped
 in every folder; for bge-small the gain was small (0.444 to 0.454). Multiple parts per file didn't help.
 Each run writes the full tree outline to `tree_<model>_<chunking>_parts<n>.txt` in its results folder.
+## Project structure
+- `main.py` - embedding / similarity experiments (ML)
+- `mcp_server/` - MCP server so an LLM can search and manage the index through the backend API (see `mcp_server/README.md`)
+
+## Project overview
+
+ReFinder is a local semantic file search project developed by our
+Texas Luminescence team. Users search with natural language to find
+files by meaning rather than exact filenames or matching keywords.
+
+For example, searching "notes about conditional probability"
+should return relevant class notes, even with a different filename.
+
+## Planned workflow
+
+1. Scan a folder selected by the user.
+2. Extract text from supported files.
+3. Use a machine learning embedding model to convert text into vectors.
+4. Store those vectors in a searchable index.
+5. Embed the user's query and retrieve the closest matches.
+6. Display results with file paths and previews.
+
+## Team responsibilities
+
+- ML: Select and evaluate embedding models and similarity search.
+- Backend: Build file indexing, index updates, and the search API.
+- Frontend: Build the search interface and file previews.
+
+## Status
+
+ReFinder is in early development. Our goal is to run file processing
+and search locally, without uploading personal files to the cloud.

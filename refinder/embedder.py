@@ -161,7 +161,7 @@ class Embedder:
 
 
 def cosine_top_k(query_vec: np.ndarray, doc_vecs: np.ndarray, k: int = 5) -> list[tuple[int, float]]:
-    """Brute-force nearest neighbors on normalized vectors. Baseline until ChromaDB is wired in."""
+    """Brute-force nearest neighbors on normalized vectors. Used by the CLI smoke test; the API uses ChromaDB."""
     scores = doc_vecs @ query_vec
     top = np.argsort(-scores)[:k]
     return [(int(i), float(scores[i])) for i in top]
