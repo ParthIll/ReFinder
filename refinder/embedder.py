@@ -14,13 +14,18 @@ DEFAULT_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 CHUNK_TOKENS = 200
 CHUNK_OVERLAP = 50
 
-# Query instructions recommended by the model authors but missing from the model's own config. Models that ship
-# their prompts (e.g. Qwen3-Embedding) don't need an entry.
-QUERY_PROMPTS = {
-    "BAAI/bge-small-en-v1.5": "Represent this sentence for searching relevant passages: ",
-    "BAAI/bge-base-en-v1.5": "Represent this sentence for searching relevant passages: ",
-    "BAAI/bge-large-en-v1.5": "Represent this sentence for searching relevant passages: ",
+# Query/document prefixes recommended by the model authors but missing from the model's own config. Models that
+# ship their prompts (e.g. Qwen3-Embedding, arctic-embed) don't need an entry.
+_BGE_QUERY = {"query": "Represent this sentence for searching relevant passages: "}
+MODEL_PROMPTS = {
+    "BAAI/bge-small-en-v1.5": _BGE_QUERY,
+    "BAAI/bge-base-en-v1.5": _BGE_QUERY,
+    "BAAI/bge-large-en-v1.5": _BGE_QUERY,
+    "nomic-ai/nomic-embed-text-v1.5": {"query": "search_query: ", "document": "search_document: "},
 }
+
+# Models whose architecture code lives in the model repo rather than in transformers.
+REMOTE_CODE_MODELS = {"nomic-ai/nomic-embed-text-v1.5", "Snowflake/snowflake-arctic-embed-m-v2.0"}
 
 
 def pick_device() -> str:
@@ -45,13 +50,15 @@ class Chunk:
 class Embedder:
     def __init__(self, model_name: str = DEFAULT_MODEL, device: str | None = None):
         self.model_name = model_name
-        self.model = SentenceTransformer(model_name, device=device or pick_device())
+        self.model = SentenceTransformer(model_name, device=device or pick_device(),
+                                         trust_remote_code=model_name in REMOTE_CODE_MODELS)
         self.tokenizer = self.model.tokenizer
         self.dim = self.model.get_embedding_dimension()
         # all-MiniLM-L6-v2 truncates at 256 word pieces; chunks must stay under that.
         self.max_seq_length = self.model.max_seq_length
-        if model_name in QUERY_PROMPTS and not self.model.prompts.get("query"):
-            self.model.prompts["query"] = QUERY_PROMPTS[model_name]
+        for kind, prompt in MODEL_PROMPTS.get(model_name, {}).items():
+            if not self.model.prompts.get(kind):
+                self.model.prompts[kind] = prompt
 
     def chunk(self, text: str, chunk_tokens: int = CHUNK_TOKENS, overlap: int = CHUNK_OVERLAP) -> list[Chunk]:
         """Split text into ~chunk_tokens-token windows that overlap by `overlap` tokens."""
