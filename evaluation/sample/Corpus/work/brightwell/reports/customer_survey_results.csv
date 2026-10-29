@@ -1,0 +1,12 @@
+region,responses,avg_satisfaction_1to5,would_recommend_pct,top_complaint,top_praise,avg_delivery_days
+Pacific Northwest,412,4.4,82,sizing runs small,jacket quality,2.8
+California,538,4.1,76,shipping slow,customer service,4.1
+Mountain West,297,4.5,85,limited color options,durability,3.2
+Southwest,188,3.9,71,shipping slow,price,4.6
+Midwest,231,4.0,74,return process confusing,boots comfort,4.9
+Northeast,346,3.8,68,shipping cost,jacket quality,5.7
+Southeast,174,3.7,65,shipping slow,customer service,5.9
+Texas,203,4.0,73,out of stock,price,4.4
+Alaska/Hawaii,41,3.5,60,shipping cost,durability,8.2
+Canada,96,3.6,62,customs fees,jacket quality,7.5
+TOTAL,2526,4.06,74,shipping slow,jacket quality,4.6

@@ -3,9 +3,13 @@
 __pycache__/
 *.pyc
 
-# IDE
+# IDE and OS
 .idea/
+.DS_Store
 
-# Local index data
+# Local caches, evaluation output, and index data
+.cache/
+evaluation/results/
+evaluation/chroma_db/
 chroma_db/
 *.sqlite3

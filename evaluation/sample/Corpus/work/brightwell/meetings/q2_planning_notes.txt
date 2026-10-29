@@ -1,0 +1,37 @@
+Brightwell Outfitters — Q2 planning
+Date: Mar 28
+Attendees: Dana W, Luis Ferrante (CEO), Hannah Cho (marketing), Raj (ops), Beth (finance), me taking notes
+
+1. Q1 recap (Beth)
+- revenue $1.42M, 6% under target. Feb was the weak month (warm winter = nobody bought insulated stuff)
+- gross margin held at 48%
+- returns up to 11%, mostly sizing on the women's hiking pants
+
+2. Paid ads (Hannah)
+- Instagram/Facebook cost per acquisition went from ~$31 to $54 since Jan. iOS tracking changes + more competition
+- ROAS on Meta under 1.5 for 3 months straight
+- DECISION: pause all paid social starting Apr 1 for the full quarter. Keep Google Shopping running at current budget.
+- redirect ~$18k/mo of the social budget: $8k to email/SMS tooling, rest held back as cushion
+- Luis nervous about losing reach, agreed to revisit at Q3 planning w/ data
+
+3. Customer support (Dana)
+- avg first response time 19 hrs, way too slow. ticket volume up 30% yoy
+- DECISION: hire 2 more support reps (one PT for weekends). Dana to post jobs by Apr 5
+- try a returns-portal tool so people stop emailing for return labels
+
+4. Product launches
+- Stormline rain jacket: factory sample had seam taping issues -> launch pushed from April to late May
+- kids line still on hold
+
+5. Ops (Raj)
+- warehouse at ~85% capacity, fine for now but need a plan before holiday season
+- carrier on-time rate dipping, Raj to keep tracking
+
+Action items
+- Hannah: pause Meta campaigns, set up Klaviyo flows (Apr 1)
+- Dana: post 2 support job listings (Apr 5)
+- Raj: get 2 quotes for returns portal (Apr 12)
+- Beth: revised Q2 forecast without paid social (Apr 8)
+- Luis: final call on Stormline launch date after 2nd sample
+
+next planning mtg: late June

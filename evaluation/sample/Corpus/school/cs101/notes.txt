@@ -1,0 +1,42 @@
+CS101 - lecture 9 (tues)
+prof okafor, room 214
+
+** quiz next thurs covers lectures 7-9 **
+
+recursion recap
+- every recursive fn needs a base case or it never stops -> stack overflow
+- the call stack: each call gets its own frame w/ its own local vars. when the base case returns, frames pop off one at a time
+- she drew the factorial(4) thing on the board:
+    fact(4) = 4 * fact(3)
+            = 4 * 3 * fact(2) ... etc
+- "trust the recursion" -- assume the smaller call works, just figure out how to combine
+
+merge sort
+- split list in half, sort each half (recursively), then merge the two sorted halves
+- merging = two pointers, take the smaller front element each time
+- runtime: log n levels of splitting, each level does n work total -> O(n log n)
+- always n log n, even best case. needs extra memory O(n) for the merge
+- compare: insertion sort is n^2 worst but fast on almost-sorted stuff
+
+big O cheat sheet (she said memorize):
+  O(1)        array index lookup
+  O(log n)    binary search
+  O(n)        single loop
+  O(n log n)  merge sort, good sorting
+  O(n^2)      nested loops, bubble sort
+  O(2^n)      naive fibonacci  <- she showed fib(35) taking forever lol
+
+memoization
+- naive fib recomputes the same values over and over
+- store results in a dict -> each fib(k) computed once -> O(n)
+- this is basically the start of dynamic programming (week 11)
+
+questions to ask in office hrs:
+- why is merge sort stable but quicksort usually isn't?
+- does python have a recursion limit? (yes, ~1000, sys.setrecursionlimit)
+- is the space for recursion counted in big O?
+
+todo
+[ ] finish hw3 (linked lists) by fri 11:59
+[ ] reread ch 5
+[x] email TA (Devon) about lab 4 regrade
