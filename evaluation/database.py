@@ -22,6 +22,7 @@ ADD_BATCH = 5000
 class ChromaIndex:
     """Chunk + embed files, persist vectors in Chroma, and search by max-pooled cosine."""
 
+    
     def __init__(self, persist_dir: Path | None = None):
         self.persist_dir = Path(persist_dir) if persist_dir else DEFAULT_PERSIST_DIR
         self.persist_dir.mkdir(parents=True, exist_ok=True)
