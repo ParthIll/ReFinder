@@ -49,6 +49,7 @@ python -m evaluation.custom --corpus Corpus --queries queries.csv
 python -m evaluation.custom --corpus evaluation/sample/Corpus --queries evaluation/sample/queries.csv  # demo set
 python -m evaluation.custom ... --distractors 300   # mix in 300 unrelated web-page files (harder, bigger index)
 python -m evaluation.custom ... --models sentence-transformers/all-MiniLM-L6-v2 BAAI/bge-small-en-v1.5
+python -m evaluation.custom ... --chunking window paragraph   # compare chunking strategies
 ```
 
 `queries.csv` format (UTF-8, header row required):
@@ -59,7 +60,33 @@ python -m evaluation.custom ... --models sentence-transformers/all-MiniLM-L6-v2 
 | `file` | yes | path relative to `Corpus/` (`finance/lease_2025.pdf`); a bare filename works if unique; join several acceptable answers with `\|` |
 | `category` | no | free label for breakdowns (persona, query style, ...) |
 
-Supported files: `.pdf`, `.docx`, and any UTF-8 text (`.txt`, `.md`, `.csv`, ...); images/archives are skipped and
+Supported files (via the team extractors in `refinder-extractors/`): `.pdf .docx .pptx .xlsx .txt .md .csv .tsv`; anything else is skipped and
 reported. Rows pointing at missing files are reported and skipped. Each run writes `summary.json` and
-`per_query.csv` (rank + top-3 files per query, for reviewing misses) to `evaluation/results/custom_<timestamp>/`.
+`per_query.csv` (rank + top-3 files per query, and where in the top file the match was, e.g.
+`chunk 7/9, page 3: Recommendation: shift parcel volume...`) to `evaluation/results/custom_<timestamp>/`.
 `evaluation/sample/` is a 45-file stand-in corpus (6 personas, confusable pairs like two leases) with 115 queries.
+
+#### Chunking and match locations
+The team extractors label pieces (`Page 3 Paragraph 2`, `Slide 4`, `Row 12`, `Table 1`, sheet ranges). `refinder/extract.py`
+strips those labels from the text the model sees and keeps them as a `location` on each piece. `paragraph` chunking
+(default) packs whole consecutive pieces into ~200-token chunks, splitting only pieces that are too long on their own.
+Each chunk starts with up to 50 tokens carried over from the end of the previous one, so details on a boundary
+stay intact. Matches are reported by chunk number plus page/slide/rows where the format has them (`chunk 3/12, page 2`). `window` chunking is the older fixed 200-token
+windows with 50-token overlap; accuracy was the same on the sample set, but windows can't say where a match is.
+
+#### Category tree (experimental)
+`refinder/tree.py` groups files into a hierarchy of semantic categories (spherical k-means on file vectors, recursively,
+with keyword labels) and supports two search modes, compared against flat search with:
+
+    python -m evaluation.custom --corpus "ReFinder File Corpus" --models Qwen/Qwen3-Embedding-0.6B \
+        --tree-beams 2 4 --tree-boost 0.25 0.5 1 --tree-parts 1 8
+
+- `--tree-beams`: prune. Descend the tree keeping the best *b* categories per level and score only the files reached.
+  Fewer chunks scored, but a file in a pruned branch can't be found.
+- `--tree-boost`: boost. Flat best-chunk score + weight x how well the query matches the file's categories.
+- `--tree-parts`: give big files up to *n* vectors (one per topic cluster of their chunks) when placing them in the tree.
+
+On the team corpus (Oct 2026): pruning at beam 4 matched flat accuracy while scoring ~1/5 of the chunks, with no
+latency gain at this size (query encoding dominates). Boost 0.5 raised Qwen3-0.6B Hit@1 from 0.571 to 0.601 and helped
+in every folder; for bge-small the gain was small (0.444 to 0.454). Multiple parts per file didn't help.
+Each run writes the full tree outline to `tree_<model>_<chunking>_parts<n>.txt` in its results folder.
