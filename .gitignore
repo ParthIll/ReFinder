@@ -14,3 +14,6 @@ ReFinder File Corpus/
 evaluation/chroma_db/
 chroma_db/
 *.sqlite3
+
+# Downloaded test corpora (evaluation/orgsmith.py)
+datasets/

@@ -243,8 +243,15 @@ def ndcg10(scores: np.ndarray, queries: list[dict]) -> np.ndarray:
     return out
 
 
-def metrics(ranks: np.ndarray, ndcg: np.ndarray) -> dict[str, float]:
+def recall10(scores: np.ndarray, queries: list[dict]) -> np.ndarray:
+    """Share of each query's correct files found in the top 10 (equals Hit@10 when there is only one)."""
+    top = np.argsort(-scores, axis=1)[:, :10]
+    return np.array([len(q["gold"] & set(map(int, top[i]))) / len(q["gold"]) for i, q in enumerate(queries)])
+
+
+def metrics(ranks: np.ndarray, ndcg: np.ndarray, recall: np.ndarray) -> dict[str, float]:
     out = {f"Hit@{k}": float((ranks <= k).mean()) for k in KS}
+    out["Recall@10"] = float(recall.mean())
     out["MRR@10"] = float(np.where(ranks <= 10, 1.0 / ranks, 0.0).mean())
     out["nDCG@10"] = float(ndcg.mean())
     out["n"] = int(len(ranks))
@@ -254,7 +261,7 @@ def metrics(ranks: np.ndarray, ndcg: np.ndarray) -> dict[str, float]:
 BREAKDOWNS = ("folder", "category", "query_type", "split", "file_type")
 
 
-def breakdowns(ranks: np.ndarray, ndcg: np.ndarray, queries: list[dict], paths: list[str]) -> dict:
+def breakdowns(ranks: np.ndarray, ndcg: np.ndarray, recall: np.ndarray, queries: list[dict], paths: list[str]) -> dict:
     groups = {"overall": {"all": np.arange(len(queries))}} | {kind: defaultdict(list) for kind in BREAKDOWNS}
     for i, q in enumerate(queries):
         target = paths[min(q["gold"])]
@@ -263,7 +270,7 @@ def breakdowns(ranks: np.ndarray, ndcg: np.ndarray, queries: list[dict], paths: 
         for kind in ("category", "query_type", "split"):
             groups[kind][q[kind]].append(i)
     return {
-        kind: {name: metrics(ranks[idx], ndcg[idx]) for name, idx in sorted(members.items())}
+        kind: {name: metrics(ranks[idx], ndcg[idx], recall[idx]) for name, idx in sorted(members.items())}
         for kind, members in groups.items()
     }
 
@@ -412,11 +419,11 @@ def time_queries(retriever, queries: list[str]) -> dict[str, float]:
 # ---------------------------------------------------------------- report
 
 def print_metrics_table(title: str, rows: dict[str, dict]) -> None:
-    cols = [f"Hit@{k}" for k in KS] + ["MRR@10", "nDCG@10"]
+    cols = [f"Hit@{k}" for k in KS] + ["Recall@10", "MRR@10", "nDCG@10"]
     width = max([len(r) for r in rows] + [len(title)]) + 2
-    print(f"\n{title:<{width}}" + "".join(f"{c:>9}" for c in cols) + f"{'n':>6}")
+    print(f"\n{title:<{width}}" + "".join(f"{c:>10}" for c in cols) + f"{'n':>6}")
     for name, m in rows.items():
-        print(f"{name:<{width}}" + "".join(f"{m[c]:>9.3f}" for c in cols) + f"{m['n']:>6}")
+        print(f"{name:<{width}}" + "".join(f"{m[c]:>10.3f}" for c in cols) + f"{m['n']:>6}")
 
 
 def main() -> None:
@@ -424,6 +431,8 @@ def main() -> None:
     ap.add_argument("--corpus", type=Path, default=REPO_ROOT / "Corpus")
     ap.add_argument("--queries", type=Path, nargs="+",
                     help="query CSV(s); default: every query CSV found inside the corpus, else ./queries.csv")
+    ap.add_argument("--exclude", nargs="*", default=[],
+                    help="corpus-relative paths to leave out of the index (e.g. an index file that lists every document)")
     ap.add_argument("--split", help="only use queries whose split column has this value (e.g. test)")
     ap.add_argument("--models", nargs="+", default=[DEFAULT_MODEL])
     ap.add_argument("--chunking", nargs="+", default=["paragraph"], choices=CHUNKING,
@@ -451,7 +460,8 @@ def main() -> None:
             sys.exit(f"queries CSV not found: {q}")
 
     paths, texts, pieces, corpus_stats = load_corpus(
-        args.corpus, exclude=query_file_exclusions(query_csvs), use_cache=not args.fresh
+        args.corpus, exclude=query_file_exclusions(query_csvs) | {(args.corpus / e).resolve() for e in args.exclude},
+        use_cache=not args.fresh
     )
     if args.distractors:
         d_paths, d_texts, d_pieces = load_distractors(args.distractors)
@@ -525,7 +535,7 @@ def main() -> None:
     for name, build in retrievers:
         r = build()
         scores = r.all_scores(q_texts)
-        ranks, nd = ranks_of_gold(scores, queries), ndcg10(scores, queries)
+        ranks, nd, rc = ranks_of_gold(scores, queries), ndcg10(scores, queries), recall10(scores, queries)
         top3 = np.argsort(-scores, axis=1)[:, :3]
         matches = [r.match(i, top3[i, 0]) for i in range(len(queries))] if isinstance(r, DenseRetriever) else None
         per_query[name] = (ranks, top3, matches)
@@ -534,7 +544,7 @@ def main() -> None:
         if isinstance(r, DenseRetriever):
             speed["model_load_s"] = r.load_s
             speed["index_mb"] = r.vecs.nbytes / 1e6
-        report[name] = {"accuracy": breakdowns(ranks, nd, queries, paths), "speed": speed}
+        report[name] = {"accuracy": breakdowns(ranks, nd, rc, queries, paths), "speed": speed}
         if routing:
             report[name]["routing"] = routing
 

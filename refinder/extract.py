@@ -9,6 +9,8 @@ model, so we parse them off into a `location` dict that stays attached to the pi
 from it, for showing where a match came from.
 """
 
+import email
+import email.policy
 import importlib.util
 import logging
 import re
@@ -37,7 +39,27 @@ _load_package()
 logging.getLogger("pypdf").setLevel(logging.ERROR)
 from refinder_extractors.extractors import EXTRACTORS, extract  # noqa: E402
 
-SUPPORTED_SUFFIXES = frozenset(EXTRACTORS)
+
+def _extract_eml(path: Path) -> list[str]:
+    """Saved email: one piece with the headers people search by, then the body's paragraphs (quoted replies
+    included, since they're part of what the file says). Attachments are listed by name, not opened."""
+    msg = email.message_from_bytes(path.read_bytes(), policy=email.policy.default)
+    headers = "\n".join(f"{h}: {msg[h]}" for h in ("Subject", "From", "To", "Cc", "Date") if msg[h])
+    body = msg.get_body(preferencelist=("plain", "html"))
+    text = body.get_content() if body else ""
+    if body and body.get_content_type() == "text/html":
+        text = re.sub(r"<[^>]+>", " ", text)
+    attachments = [a.get_filename() for a in msg.iter_attachments() if a.get_filename()]
+    pieces = [headers] + [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
+    if attachments:
+        pieces.append("Attachments: " + ", ".join(attachments))
+    return pieces
+
+
+# Formats the team extractors don't cover yet, handled here.
+LOCAL_EXTRACTORS = {".eml": _extract_eml}
+
+SUPPORTED_SUFFIXES = frozenset(EXTRACTORS) | frozenset(LOCAL_EXTRACTORS)
 
 
 class UnsupportedFile(Exception):
@@ -82,7 +104,8 @@ def extract_pieces(path: Path) -> list[Piece]:
     if suffix not in SUPPORTED_SUFFIXES or path.name.startswith(("~$", ".")):
         raise UnsupportedFile(f"skipped type {suffix or path.name}")
     pieces = []
-    for i, raw in enumerate(extract(path), 1):
+    raw_pieces = LOCAL_EXTRACTORS[suffix](path) if suffix in LOCAL_EXTRACTORS else extract(path)
+    for i, raw in enumerate(raw_pieces, 1):
         text, location = _strip_label(raw, suffix)
         if text.strip():
             pieces.append(Piece(text, {"piece": i, **location}))
