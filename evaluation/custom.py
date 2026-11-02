@@ -29,6 +29,7 @@ measured one query at a time like a user typing into the search box.
     python -m evaluation.custom --distractors 300                   # + 300 unlabeled web-page files as noise
     python -m evaluation.custom --chunking window paragraph         # compare chunking strategies
     python -m evaluation.custom --tree-beams 1 2 4                  # + coarse-to-fine category tree search
+    python -m evaluation.custom --rerank BAAI/bge-reranker-v2-m3    # + cross-encoder re-scoring of top chunks
 """
 
 import argparse
@@ -46,8 +47,8 @@ import bm25s
 import numpy as np
 import Stemmer
 
-from evaluation.common import CACHE_DIR, CHUNKING, REPO_ROOT, RESULTS_DIR, embed_corpus
-from refinder.embedder import DEFAULT_MODEL, Embedder
+from evaluation.common import CACHE_DIR, CHUNKING, REPO_ROOT, RESULTS_DIR, chunk_corpus, embed_corpus
+from refinder.embedder import DEFAULT_MODEL, Embedder, pick_device
 from refinder.extract import Piece, UnsupportedFile, describe_location, extract_pieces, pieces_from_text
 from refinder.tree import VectorTree
 
@@ -383,6 +384,49 @@ class TreeRetriever:
                 "chunks_total": int(len(self.dense.vecs))}
 
 
+class RerankRetriever:
+    """Dense retrieval, then a cross-encoder re-scores the `depth` best chunks for each query.
+
+    A cross-encoder reads the query and a passage together, so it judges relevance more sharply than comparing two
+    separately computed vectors, but it is too slow to run on every chunk. Files with a re-scored chunk rank first,
+    by their best cross-encoder score; every other file keeps its dense order below them.
+    """
+
+    def __init__(self, dense: DenseRetriever, texts: list[str], chunking: str, model_name: str, depth: int):
+        from sentence_transformers import CrossEncoder
+
+        t0 = time.perf_counter()
+        self.dense, self.depth, self.n_files = dense, depth, dense.n_files
+        self.model = CrossEncoder(model_name, device=pick_device())
+        # Same chunking call as embed_corpus, so chunk i here is vector i in dense.vecs.
+        self.chunk_texts, _, _ = chunk_corpus(dense.embedder, texts, [[p.text for p in ps] for ps in dense.pieces],
+                                              chunking)
+        self.index_stats = {"index_s": time.perf_counter() - t0}
+
+    def _rerank(self, query: str, q_vec: np.ndarray, dense_scores: np.ndarray) -> np.ndarray:
+        chunk_scores = self.dense.vecs @ q_vec
+        depth = min(self.depth, len(chunk_scores))
+        top = np.argpartition(-chunk_scores, depth - 1)[:depth]
+        ce = self.model.predict([(query, self.chunk_texts[c]) for c in top], show_progress_bar=False)
+        out = dense_scores - 1e3  # cosine is in [-1, 1], so these stay below every re-scored file
+        best: dict[int, float] = {}
+        for c, s in zip(top, ce):
+            f = int(self.dense.owner[c])
+            best[f] = max(best.get(f, -np.inf), float(s))
+        for f, s in best.items():
+            out[f] = 1e3 + s
+        return out
+
+    def all_scores(self, queries: list[str]) -> np.ndarray:
+        dense_scores = self.dense.all_scores(queries)
+        return np.stack([self._rerank(q, v, s) for q, v, s in zip(queries, self.dense.q_vecs, dense_scores)])
+
+    def search(self, query: str, k: int = 10) -> np.ndarray:
+        q_vec = self.dense.embedder.encode_query(query)
+        s = self._rerank(query, q_vec, self.dense.score(q_vec[None])[0])
+        return np.argsort(-s)[:k]
+
+
 class BM25Retriever:
     def __init__(self, texts: list[str]):
         self.stemmer = Stemmer.Stemmer("english")
@@ -446,6 +490,9 @@ def main() -> None:
     ap.add_argument("--tree-part-chunks", type=int, default=40, help="roughly one part vector per this many chunks")
     ap.add_argument("--tree-branching", type=int, default=8, help="max child categories per tree node")
     ap.add_argument("--tree-leaf", type=int, default=10, help="max file parts in a leaf category")
+    ap.add_argument("--rerank", nargs="*", default=[],
+                    help="cross-encoder model(s) that re-score each dense model's top chunks")
+    ap.add_argument("--rerank-depth", type=int, default=30, help="chunks per query handed to the reranker")
     ap.add_argument("--no-bm25", action="store_true")
     ap.add_argument("--distractors", type=int, default=0, help="add N unlabeled Kaggle web-text files as noise")
     ap.add_argument("--fresh", action="store_true",
@@ -528,6 +575,9 @@ def main() -> None:
                                for b in args.tree_beams]
                 retrievers += [(f"{name} boost {w:g}{suffix}", lambda m=m, c=c, p=p, w=w: tree(m, c, p, weight=w))
                                for w in args.tree_boost]
+            retrievers += [(f"{name} + {rm.split('/')[-1]}",
+                            lambda m=m, c=c, rm=rm: RerankRetriever(dense(m, c), texts, c, rm, args.rerank_depth))
+                           for rm in args.rerank]
     if not args.no_bm25:
         retrievers.append(("bm25", lambda: BM25Retriever(texts)))
 

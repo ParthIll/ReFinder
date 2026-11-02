@@ -17,11 +17,15 @@ CHUNK_OVERLAP = 50
 # Query/document prefixes recommended by the model authors but missing from the model's own config. Models that
 # ship their prompts (e.g. Qwen3-Embedding, arctic-embed) don't need an entry.
 _BGE_QUERY = {"query": "Represent this sentence for searching relevant passages: "}
+# Harrier ships named prompts but leaves "query" empty; its card says queries need a one-sentence instruction.
+_HARRIER_QUERY = {"query": "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery: "}
 MODEL_PROMPTS = {
     "BAAI/bge-small-en-v1.5": _BGE_QUERY,
     "BAAI/bge-base-en-v1.5": _BGE_QUERY,
     "BAAI/bge-large-en-v1.5": _BGE_QUERY,
     "nomic-ai/nomic-embed-text-v1.5": {"query": "search_query: ", "document": "search_document: "},
+    "microsoft/harrier-oss-v1-270m": _HARRIER_QUERY,
+    "microsoft/harrier-oss-v1-0.6b": _HARRIER_QUERY,
 }
 
 # Models whose architecture code lives in the model repo rather than in transformers.
