@@ -137,7 +137,7 @@ def index_folder(request: IndexRequest) -> IndexResponse:
         # new_paths contains filenames.
         # new_texts contains the corresponding file contents.
         # stats contains extraction statistics.
-        new_paths, new_texts, stats = load_corpus(folder)
+        new_paths, new_texts, _pieces, stats = load_corpus(folder)
 
         # Do not create an empty search index.
         if not new_paths:

@@ -10,4 +10,7 @@ bm25s
 PyStemmer
 pypdf
 python-docx
+openpyxl
+python-pptx
+fonttools
 chromadb

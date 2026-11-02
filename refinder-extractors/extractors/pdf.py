@@ -37,7 +37,7 @@ def extract_pdf(path: Path) -> list[str]:
     chunks = []
     for page_number, page in enumerate(reader.pages, 1):
         text = page.extract_text() or ""
-        for paragraph in _page_paragraphs(text):
+        for paragraph_number,paragraph in enumerate(_page_paragraphs(text),1):
             if paragraph:
-                chunks.append(f"Page {page_number}\n{paragraph}")
+                chunks.append(f"Page {page_number} Paragraph {paragraph_number}\n{paragraph}")
     return chunks
