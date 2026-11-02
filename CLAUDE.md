@@ -33,45 +33,53 @@ Shared contracts (agree before parallel work):
 Ownership: ML owns embedding + retrieval quality and the relevance report; Backend owns scanning, indexing,
 persistence, API; Frontend owns setup/search/preview UX.
 
-## What exists in this repo (main / andrew)
+## What exists in this repo
 
-- `refinder/embedder.py` — `Embedder` wraps Sentence Transformers: token-window chunking (200 tokens, 50 overlap),
-  `encode` (documents) / `encode_queries` (queries), L2-normalized float32 so dot product == cosine.
-  `DEFAULT_MODEL` is still `all-MiniLM-L6-v2`; the PRD's chosen MVP model is `BAAI/bge-small-en-v1.5` (384-d) with
-  the query instruction "Represent this sentence for searching relevant passages: " on queries only.
-- `refinder/extract.py` — simple PDF/DOCX/plain-text extraction used by the API and eval harness.
-- `evaluation/server.py` + `evaluation/database.py` — the current FastAPI backend (Sanjay). `ChromaIndex` persists
-  chunks in `evaluation/chroma_db/` (cosine HNSW) and a `manifest.json` with every file's extracted text.
+`andrew` = `main` (Sanjay's FastAPI + Chroma backend) merged with `testing-environment` (Parth's ML/eval work).
+
+- `refinder/embedder.py` — `Embedder` wraps Sentence Transformers; `encode` (documents) / `encode_queries`
+  (queries), L2-normalized float32 so dot product == cosine. Two chunkers: `chunk` (fixed 200-token windows,
+  50 overlap) and `chunk_pieces` (packs whole extractor pieces to ~200 tokens with a 50-token carry-over and keeps
+  piece ranges for locations). `MODEL_PROMPTS` adds missing query/document prefixes (bge query instruction, nomic);
+  `REMOTE_CODE_MODELS` enables trust_remote_code. `DEFAULT_MODEL` is still `all-MiniLM-L6-v2`; the PRD's MVP model
+  is `BAAI/bge-small-en-v1.5` (384-d).
+- `refinder/extract.py` — bridge that loads `refinder-extractors/` via importlib as `refinder_extractors`, adds
+  `.eml`, and turns labelled pieces ("Page 3 Paragraph 2", "Slide 4", "Row 12") into `Piece(text, location)`.
+  `extract_text` joins pieces for callers that want one string.
+- `refinder/tree.py` — experimental semantic category tree over files (spherical k-means); `prune` (beam search)
+  and `boost` (category-match bonus) search modes.
+- `evaluation/server.py` + `evaluation/database.py` — the FastAPI backend (Sanjay). `ChromaIndex` persists chunks
+  in `evaluation/chroma_db/` (cosine HNSW) plus a `manifest.json` holding every file's extracted text.
   `/index` is synchronous and rebuilds the whole collection for one folder; no SQLite ledger, no incremental
-  rescan, no delete/rename handling yet. Search fetches `max(20k, 50)` chunks and keeps the best chunk per file.
-- `evaluation/custom.py` — main benchmark: corpus folder + `queries.csv` (query,file[,category]); dense vs BM25,
-  Hit@1/5/10, MRR@10, nDCG@10, latency p50/p95. `evaluation/sample/` is a 45-file stand-in corpus, 115 queries.
-- `evaluation/semantic_matching.py` (Kaggle known-item), `evaluation/beir.py` (SciFact/NFCorpus/FiQA nDCG@10).
-- `refinder-extractors/` — richer per-format extractors (pdf/docx/pptx/xlsx/txt/md/csv/tsv) and a SQLite
-  one-row-per-file indexer with size/mtime/sha256 skip. Not importable as-is: hyphenated dir, relative imports, and
-  `pyproject.toml`/`test.py` reference a `refinder.` package path that doesn't exist (and would collide with the
-  root `refinder/`). The `testing-environment` branch loads it via importlib under the name `refinder_extractors`.
+  rescan, no delete/rename handling. Search fetches `max(20k, 50)` chunks and keeps the best chunk per file.
+  Note: the API indexes with window `chunk()` and the default model, so it does not yet match what the benchmark
+  measures (paragraph chunking, chosen model, locations).
+- `evaluation/custom.py` — main benchmark: corpus folder + query CSV(s); auto-discovers the team's per-folder
+  query CSVs (source_file/corpus_path, secondary_relevant_files, query_type, split). Dense vs BM25, Hit@1/5/10,
+  Recall@10, MRR@10, graded nDCG@10, breakdowns by folder/category/file type, latency, `--chunking`, `--tree-*`.
+  `evaluation/sample/` is a 45-file stand-in corpus with 115 queries.
+- `evaluation/orgsmith.py`, `evaluation/financebench.py` — download external test corpora into `datasets/`.
+  `evaluation/semantic_matching.py` (Kaggle known-item), `evaluation/beir.py` (SciFact/NFCorpus/FiQA nDCG@10).
+- `refinder-extractors/` — the team's per-format extractors (pdf/docx/pptx/xlsx/txt/md/csv/tsv) and a standalone
+  SQLite one-row-per-file indexer with size/mtime/sha256 skip. Kept unmodified; not importable on its own
+  (hyphenated dir, `pyproject.toml`/`test.py` point at a nonexistent `refinder.` path), so use it via
+  `refinder/extract.py`.
 - `mcp_server/` — MCP adapter calling the FastAPI routes; `dev/stub_backend.py` is a fake backend for testing.
 - `main.py` — toy embedding smoke test.
-
-## Other branches
-
-- `origin/testing-environment` (Parth, ML) is ahead of main with: extractor bridge + paragraph-aware chunking with
-  page/slide/row locations, `MODEL_PROMPTS` (bge query instruction, nomic prefixes), Qwen3/granite/arctic support,
-  `refinder/tree.py` semantic category tree (prune/boost), team-corpus query CSV auto-discovery, OrgSmith and
-  FinanceBench corpora, `.eml` extraction. Check it before re-implementing any of these; it isn't merged to main.
 
 ## Evaluation data
 
 - Team corpus = Google Drive folder "ReFinder File Corpus", one subfolder per member (Andrew, Parth, Sanjay, Dagem,
   Elliot) with per-folder query CSVs (columns like document_type, corpus_path/source_file, query_id, query_type,
   query, split). Mirror it locally as `ReFinder File Corpus/` at the repo root (gitignored) and run
-  `python -m evaluation.custom --corpus "ReFinder File Corpus"` on testing-environment.
+  `python -m evaluation.custom --corpus "ReFinder File Corpus"`.
 - Andrew/ holds 50 synthetic PDFs (Agreements and Contracts, Careers and Resumes, Email and Correspondence,
   Financial Statements, Tax and Government Forms) with 150 labeled queries. Baseline (Oct 14): bge-small
   Hit@1 134/150, Hit@5 148/150, MRR 0.935; BM25 133/147; BGE+BM25 RRF Hit@1 137/150.
-- On the full team corpus, Hit@1 is much lower (≈0.44 bge-small, ≈0.57–0.60 Qwen3-0.6B per testing-environment
-  README), well under the PRD gate (Hit@1 ≥ 0.75, Hit@5 ≥ 0.90). Treat that gap as the main ML problem.
+- On the full team corpus, Hit@1 is much lower (≈0.44 bge-small, ≈0.57–0.60 Qwen3-0.6B per README), well under
+  the PRD gate (Hit@1 ≥ 0.75, Hit@5 ≥ 0.90). On OrgSmith (441 questions) BM25 Hit@1 0.782 beat bge-base 0.773,
+  bge-small 0.762, Qwen3-0.6B 0.694. Treat the team-corpus gap and exact-term misses as the main ML problems.
+- Sample corpus sanity check (merged code, bge-small, paragraph chunks): Hit@1 0.878, Hit@5 1.000; BM25 0.783/0.930.
 - Never commit corpora, results, or Chroma data (`.cache/`, `evaluation/results/`, `chroma_db/`, `datasets/`).
 
 ## Commands
@@ -79,6 +87,7 @@ persistence, API; Frontend owns setup/search/preview UX.
 ```bash
 python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt
 uvicorn evaluation.server:app --reload          # API at http://127.0.0.1:8000/docs
+HF_HUB_OFFLINE=1 ...                            # prove a command runs offline once models are cached
 python -m evaluation.custom --corpus evaluation/sample/Corpus --queries evaluation/sample/queries.csv \
     --models BAAI/bge-small-en-v1.5
 python -m evaluation.beir --datasets scifact --models BAAI/bge-small-en-v1.5
