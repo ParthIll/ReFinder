@@ -30,11 +30,17 @@ measured one query at a time like a user typing into the search box.
     python -m evaluation.custom --chunking window paragraph         # compare chunking strategies
     python -m evaluation.custom --tree-beams 1 2 4                  # + coarse-to-fine category tree search
     python -m evaluation.custom --rerank BAAI/bge-reranker-v2-m3    # + cross-encoder re-scoring of top chunks
+    python -m evaluation.custom --rerank <model> --rerank-mode files --rerank-blend 0.3 --rerank-names on
+    python -m evaluation.custom --size-penalty 0.02                 # + penalize outsized files (10x median chunks)
+    python -m evaluation.custom --file-vector 1 --size-penalty 0.02 # + whole-file mean vector
+    python -m evaluation.custom --models microsoft/harrier-oss-v1-0.6b --file-vector 1 --size-penalty 0.02 \
+        --rerank Alibaba-NLP/gte-reranker-modernbert-base --rerank-fuse 1  # best overall setup (Nov 2026)
 """
 
 import argparse
 import csv
 import hashlib
+import itertools
 import json
 import pickle
 import random
@@ -384,47 +390,147 @@ class TreeRetriever:
                 "chunks_total": int(len(self.dense.vecs))}
 
 
-class RerankRetriever:
-    """Dense retrieval, then a cross-encoder re-scores the `depth` best chunks for each query.
+class FileScoreRetriever:
+    """Dense retrieval with file-level terms added to each file's best-chunk score.
 
-    A cross-encoder reads the query and a passage together, so it judges relevance more sharply than comparing two
-    separately computed vectors, but it is too slow to run on every chunk. Files with a re-scored chunk rank first,
-    by their best cross-encoder score; every other file keeps its dense order below them.
+    file_vector W: + W x cosine(query, the file's mean vector), the normalized average of its chunk vectors. The
+        best chunk says "this passage matches"; the mean vector says "this file is about that", which is what
+        whole-document queries ("notes on ...", "the practice exam covering ...") describe. W=1 gave +5.2 Hit@1 on
+        held-out team members (leave-one-member-out), every member improved, OrgSmith and the sample unchanged.
+    size_penalty W: files over OUTLIER x the median chunk count lose W x log(excess). A file scored by its best
+        chunk gets one chance per chunk, so a whole textbook wins queries meant for shorter files on its topic.
+        Penalizing every file by size hurt OrgSmith, where answers are often the longer documents; outliers only
+        left it unchanged and gave +1.2 held-out on the team corpus (W=0.02).
     """
 
-    def __init__(self, dense: DenseRetriever, texts: list[str], chunking: str, model_name: str, depth: int):
+    OUTLIER = 10
+
+    def __init__(self, dense: DenseRetriever, file_vector: float = 0.0, size_penalty: float = 0.0):
+        self.dense, self.n_files, self.file_vector = dense, dense.n_files, file_vector
+        ends = np.r_[dense.starts[1:], len(dense.owner)]
+        self.mean_vecs = np.zeros((dense.n_files, dense.vecs.shape[1]), np.float32)
+        for f, s, e in zip(dense.doc_ids, dense.starts, ends):
+            v = dense.vecs[s:e].mean(0)
+            self.mean_vecs[f] = v / max(float(np.linalg.norm(v)), 1e-12)
+        n_chunks = np.bincount(dense.owner, minlength=dense.n_files).clip(min=1)
+        excess = np.log(n_chunks / (self.OUTLIER * np.median(n_chunks)))
+        self.penalty = (size_penalty * np.maximum(excess, 0)).astype(np.float32)
+        self.index_stats = {"index_s": 0.0}
+
+    def score(self, q_vecs: np.ndarray) -> np.ndarray:
+        # Files without chunks stay at -inf from dense.score.
+        return self.dense.score(q_vecs) + self.file_vector * (q_vecs @ self.mean_vecs.T) - self.penalty
+
+    def all_scores(self, queries: list[str]) -> np.ndarray:
+        self.dense.all_scores(queries)  # sets dense.q_vecs
+        return self.score(self.dense.q_vecs)
+
+    def search(self, query: str, k: int = 10) -> np.ndarray:
+        return np.argsort(-self.score(self.dense.embedder.encode_query(query)[None])[0])[:k]
+
+
+_CROSS_ENCODERS: dict[str, object] = {}
+
+
+class RerankRetriever:
+    """Dense retrieval, then a cross-encoder re-scores the best candidates for each query.
+
+    A cross-encoder reads the query and a passage together, so it judges relevance more sharply than comparing two
+    separately computed vectors, but it is too slow to run on every chunk. `depth` (query, passage) pairs are scored:
+
+    mode   chunks: the `depth` best chunks overall (one huge file can take most of the slots).
+           files:  the depth // PER_FILE best files, each with its PER_FILE best chunks.
+    blend  0: re-scored files rank first by their best cross-encoder score, the rest keep dense order below them.
+           w > 0: file score = dense score + w x cross-encoder probability, so a reranker that is weaker than the
+           dense model on some data can't overrule it outright.
+    fuse   w > 0 (overrides blend): reciprocal rank fusion, 1/(60 + first-stage rank) + w/(60 + reranker rank).
+           Uses ranks, so it means the same on every corpus. With `first` = FileScoreRetriever(file vector 1,
+           size penalty 0.02) and gte-reranker-modernbert-base at w=1, held-out team Hit@1 rose +3 to +6 points
+           and OrgSmith +6 to +12 (Qwen3 and Harrier). Tied scores share a rank: exact duplicate files tie, and
+           breaking the tie by file order would mark the labeled copy as a miss.
+    names  prefix each passage with its file's folder and name, for the reranker only (embeddings never see names).
+    first  first-stage retriever over `dense` with a score(q_vecs) method; defaults to `dense` itself.
+    """
+
+    PER_FILE = 2
+    RRF_K = 60
+
+    def __init__(self, dense: DenseRetriever, texts: list[str], paths: list[str], chunking: str, model_name: str,
+                 depth: int, mode: str = "chunks", blend: float = 0.0, names: bool = False, fuse: float = 0.0,
+                 first=None):
         from sentence_transformers import CrossEncoder
 
         t0 = time.perf_counter()
         self.dense, self.depth, self.n_files = dense, depth, dense.n_files
-        self.model = CrossEncoder(model_name, device=pick_device())
-        # Same chunking call as embed_corpus, so chunk i here is vector i in dense.vecs.
-        self.chunk_texts, _, _ = chunk_corpus(dense.embedder, texts, [[p.text for p in ps] for ps in dense.pieces],
-                                              chunking)
+        self.mode, self.blend, self.fuse = mode, blend, fuse
+        self.first = first or dense
+        if model_name not in _CROSS_ENCODERS:
+            _CROSS_ENCODERS[model_name] = CrossEncoder(model_name, device=pick_device())
+        self.model = _CROSS_ENCODERS[model_name]
+        # Same chunking call as embed_corpus, so chunk i here is vector i in dense.vecs. Cached on the dense
+        # retriever because every reranker variant over it needs the same texts.
+        if not hasattr(dense, "chunk_texts"):
+            dense.chunk_texts, _, _ = chunk_corpus(dense.embedder, texts,
+                                                   [[p.text for p in ps] for ps in dense.pieces], chunking)
+        self.chunk_texts = dense.chunk_texts
+        self.labels = [f"{Path(p).parent.name}/{Path(p).stem}\n" if names else "" for p in paths]
+        # Chunks are contiguous per file: file f owns chunk ids span[f][0]:span[f][1].
+        ends = np.r_[dense.starts[1:], len(dense.owner)]
+        self.span = {int(f): (int(s), int(e)) for f, s, e in zip(dense.doc_ids, dense.starts, ends)}
         self.index_stats = {"index_s": time.perf_counter() - t0}
+
+    def _candidates(self, chunk_scores: np.ndarray, file_scores: np.ndarray) -> np.ndarray:
+        if self.mode == "chunks":
+            depth = min(self.depth, len(chunk_scores))
+            return np.argpartition(-chunk_scores, depth - 1)[:depth]
+        n_files = min(max(self.depth // self.PER_FILE, 1), int(np.isfinite(file_scores).sum()))
+        files = np.argpartition(-file_scores, n_files - 1)[:n_files]
+        out = []
+        for f in files:
+            s, e = self.span[int(f)]
+            out.extend(s + np.argsort(-chunk_scores[s:e])[: self.PER_FILE])
+        return np.array(out, dtype=int)
 
     def _rerank(self, query: str, q_vec: np.ndarray, dense_scores: np.ndarray) -> np.ndarray:
         chunk_scores = self.dense.vecs @ q_vec
-        depth = min(self.depth, len(chunk_scores))
-        top = np.argpartition(-chunk_scores, depth - 1)[:depth]
-        ce = self.model.predict([(query, self.chunk_texts[c]) for c in top], show_progress_bar=False)
-        out = dense_scores - 1e3  # cosine is in [-1, 1], so these stay below every re-scored file
+        top = self._candidates(chunk_scores, dense_scores)
+        pairs = [(query, self.labels[self.dense.owner[c]] + self.chunk_texts[c]) for c in top]
+        ce = np.asarray(self.model.predict(pairs, show_progress_bar=False), dtype=np.float64)
+        if ce.min() < 0 or ce.max() > 1:  # raw logits: map to probabilities so blend weights mean the same thing
+            ce = 1 / (1 + np.exp(-ce))
         best: dict[int, float] = {}
         for c, s in zip(top, ce):
             f = int(self.dense.owner[c])
             best[f] = max(best.get(f, -np.inf), float(s))
+        if self.fuse > 0:
+            ce_scores = np.full(len(dense_scores), -np.inf)
+            ce_scores[list(best)] = list(best.values())
+            out = 1.0 / (self.RRF_K + _ranks(dense_scores))
+            out[list(best)] += self.fuse / (self.RRF_K + _ranks(ce_scores)[list(best)])
+            return np.where(np.isfinite(dense_scores), out, -np.inf)
+        if self.blend > 0:
+            out = dense_scores.copy()
+            for f, s in best.items():
+                out[f] += self.blend * s
+            return out
+        out = dense_scores - 1e3  # cosine is in [-1, 1], so these stay below every re-scored file
         for f, s in best.items():
             out[f] = 1e3 + s
         return out
 
     def all_scores(self, queries: list[str]) -> np.ndarray:
-        dense_scores = self.dense.all_scores(queries)
-        return np.stack([self._rerank(q, v, s) for q, v, s in zip(queries, self.dense.q_vecs, dense_scores)])
+        first_scores = self.first.all_scores(queries)  # also sets dense.q_vecs
+        return np.stack([self._rerank(q, v, s) for q, v, s in zip(queries, self.dense.q_vecs, first_scores)])
 
     def search(self, query: str, k: int = 10) -> np.ndarray:
         q_vec = self.dense.embedder.encode_query(query)
-        s = self._rerank(query, q_vec, self.dense.score(q_vec[None])[0])
+        s = self._rerank(query, q_vec, self.first.score(q_vec[None])[0])
         return np.argsort(-s)[:k]
+
+
+def _ranks(scores: np.ndarray) -> np.ndarray:
+    """1-based rank of each entry, highest score first; equal scores share the best rank."""
+    return np.searchsorted(np.sort(-scores), -scores, side="left") + 1
 
 
 class BM25Retriever:
@@ -490,9 +596,21 @@ def main() -> None:
     ap.add_argument("--tree-part-chunks", type=int, default=40, help="roughly one part vector per this many chunks")
     ap.add_argument("--tree-branching", type=int, default=8, help="max child categories per tree node")
     ap.add_argument("--tree-leaf", type=int, default=10, help="max file parts in a leaf category")
+    ap.add_argument("--file-vector", type=float, nargs="*", default=[],
+                    help="also add WEIGHT x cosine(query, file mean vector) to each file's best-chunk score")
+    ap.add_argument("--size-penalty", type=float, nargs="*", default=[],
+                    help="also penalize files over 10x the median chunk count by WEIGHT x log(excess), per WEIGHT")
     ap.add_argument("--rerank", nargs="*", default=[],
                     help="cross-encoder model(s) that re-score each dense model's top chunks")
-    ap.add_argument("--rerank-depth", type=int, default=30, help="chunks per query handed to the reranker")
+    ap.add_argument("--rerank-depth", type=int, default=30, help="(query, passage) pairs scored per query")
+    ap.add_argument("--rerank-mode", nargs="+", default=["chunks"], choices=("chunks", "files"),
+                    help="candidates: best chunks overall, or best files with their 2 best chunks each")
+    ap.add_argument("--rerank-blend", type=float, nargs="+", default=[0.0],
+                    help="0 = reranker order replaces dense order; W > 0 = dense score + W x reranker probability")
+    ap.add_argument("--rerank-fuse", type=float, nargs="+", default=[0.0],
+                    help="W > 0: reciprocal rank fusion of first stage and reranker, reranker weighted W")
+    ap.add_argument("--rerank-names", nargs="+", default=["off"], choices=("off", "on"),
+                    help="prefix passages with folder/filename for the reranker")
     ap.add_argument("--no-bm25", action="store_true")
     ap.add_argument("--distractors", type=int, default=0, help="add N unlabeled Kaggle web-text files as noise")
     ap.add_argument("--fresh", action="store_true",
@@ -575,9 +693,23 @@ def main() -> None:
                                for b in args.tree_beams]
                 retrievers += [(f"{name} boost {w:g}{suffix}", lambda m=m, c=c, p=p, w=w: tree(m, c, p, weight=w))
                                for w in args.tree_boost]
-            retrievers += [(f"{name} + {rm.split('/')[-1]}",
-                            lambda m=m, c=c, rm=rm: RerankRetriever(dense(m, c), texts, c, rm, args.rerank_depth))
-                           for rm in args.rerank]
+            for fv, sp in itertools.product(args.file_vector or [0.0], args.size_penalty or [0.0]):
+                if fv or sp:
+                    tag = " ".join(([f"file-vector {fv:g}"] if fv else []) + ([f"size-penalty {sp:g}"] if sp else []))
+                    retrievers.append((f"{name} {tag}", lambda m=m, c=c, fv=fv, sp=sp:
+                                       FileScoreRetriever(dense(m, c), fv, sp)))
+            # The reranker runs on top of the last --file-vector / --size-penalty values given (or plain dense).
+            fv0 = args.file_vector[-1] if args.file_vector else 0.0
+            sp0 = args.size_penalty[-1] if args.size_penalty else 0.0
+            first_tag = " ".join(([f"file-vector {fv0:g}"] if fv0 else []) + ([f"size-penalty {sp0:g}"] if sp0 else []))
+            for rm, mode, w, nm, fu in itertools.product(args.rerank, args.rerank_mode, args.rerank_blend,
+                                                         args.rerank_names, args.rerank_fuse):
+                tag = ", ".join([mode] + ([f"fuse {fu:g}"] if fu > 0 else [f"blend {w:g}"] if w > 0 else [])
+                                + (["names"] if nm == "on" else []))
+                retrievers.append((f"{name}{' ' + first_tag if first_tag else ''} + {rm.split('/')[-1]} [{tag}]",
+                                   lambda m=m, c=c, rm=rm, mode=mode, w=w, nm=nm, fu=fu: RerankRetriever(
+                                       dense(m, c), texts, paths, c, rm, args.rerank_depth, mode, w, nm == "on", fu,
+                                       FileScoreRetriever(dense(m, c), fv0, sp0) if fv0 or sp0 else None)))
     if not args.no_bm25:
         retrievers.append(("bm25", lambda: BM25Retriever(texts)))
 
