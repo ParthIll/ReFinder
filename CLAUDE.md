@@ -80,6 +80,11 @@ persistence, API; Frontend owns setup/search/preview UX.
   the PRD gate (Hit@1 ≥ 0.75, Hit@5 ≥ 0.90). On OrgSmith (441 questions) BM25 Hit@1 0.782 beat bge-base 0.773,
   bge-small 0.762, Qwen3-0.6B 0.694. Treat the team-corpus gap and exact-term misses as the main ML problems.
 - Sample corpus sanity check (merged code, bge-small, paragraph chunks): Hit@1 0.878, Hit@5 1.000; BM25 0.783/0.930.
+- Best setup so far (evaluation/ITERATIONS.md): Harrier-0.6b + whole-file vector (`--file-vector 1`) + outlier
+  size penalty (`--size-penalty 0.02`) + gte-reranker-modernbert-base fused by rank (`--rerank-fuse 1`):
+  team 0.679 / OrgSmith 0.838 / sample 0.957 Hit@1, ~0.4 s per search. Not yet wired into the API.
+- 54 team-corpus files are exact duplicates (Dagem/Sanjay CS 314 slides). Ties count as hits; any rank fusion must
+  give tied scores the same rank. Use `python -m evaluation.lab` (leave-one-member-out + bootstrap) for new changes.
 - Never commit corpora, results, or Chroma data (`.cache/`, `evaluation/results/`, `chroma_db/`, `datasets/`).
 
 ## Commands
