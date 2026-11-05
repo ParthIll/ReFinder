@@ -10,6 +10,10 @@ __pycache__/
 # Local caches, evaluation output, and index data
 .cache/
 evaluation/results/
+ReFinder File Corpus/
 evaluation/chroma_db/
 chroma_db/
 *.sqlite3
+
+# Downloaded test corpora (evaluation/orgsmith.py)
+datasets/

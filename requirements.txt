@@ -9,5 +9,9 @@ datasets
 bm25s
 PyStemmer
 pypdf
+cryptography
 python-docx
+openpyxl
+python-pptx
+fonttools
 chromadb
