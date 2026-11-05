@@ -31,6 +31,9 @@ MODEL_PROMPTS = {
 # Models whose architecture code lives in the model repo rather than in transformers.
 REMOTE_CODE_MODELS = {"nomic-ai/nomic-embed-text-v1.5", "Snowflake/snowflake-arctic-embed-m-v2.0"}
 
+# Models that run through ONNX Runtime on CPU: float32 ONNX matched PyTorch's vectors at about 1.7x the speed.
+ONNX_MODELS = {"microsoft/harrier-oss-v1-270m"}
+
 
 def pick_device() -> str:
     if torch.cuda.is_available():
@@ -54,7 +57,10 @@ class Chunk:
 class Embedder:
     def __init__(self, model_name: str = DEFAULT_MODEL, device: str | None = None):
         self.model_name = model_name
-        self.model = SentenceTransformer(model_name, device=device or pick_device(),
+        device = device or pick_device()
+        # Harrier defaults to bfloat16, about 7x slower than float32 on CPU (1.6 vs 11.5 chunks/s for the 270m model).
+        model_kwargs = {"dtype": torch.float32} if device == "cpu" else None
+        self.model = SentenceTransformer(model_name, device=device, model_kwargs=model_kwargs,
                                          trust_remote_code=model_name in REMOTE_CODE_MODELS)
         self.tokenizer = self.model.tokenizer
         self.dim = self.model.get_embedding_dimension()
@@ -63,6 +69,14 @@ class Embedder:
         for kind, prompt in MODEL_PROMPTS.get(model_name, {}).items():
             if not self.model.prompts.get(kind):
                 self.model.prompts[kind] = prompt
+        self.onnx_session = None
+        if device == "cpu" and model_name in ONNX_MODELS:
+            try:
+                from refinder.onnx_encoder import load_session
+
+                self.onnx_session = load_session(model_name, self.tokenizer)
+            except Exception as e:  # missing package or failed export: PyTorch gives the same vectors, just slower
+                print(f"  ONNX unavailable ({type(e).__name__}: {e}); using PyTorch")
 
     def chunk(self, text: str, chunk_tokens: int = CHUNK_TOKENS, overlap: int = CHUNK_OVERLAP) -> list[Chunk]:
         """Split text into ~chunk_tokens-token windows that overlap by `overlap` tokens."""
@@ -152,15 +166,26 @@ class Embedder:
             show_progress_bar=show_progress,
         ).astype(np.float32)
 
+    def _encode_onnx(self, texts: list[str], prompt_kind: str, batch_size: int, show_progress: bool) -> np.ndarray:
+        from refinder.onnx_encoder import encode_last_token
+
+        prompt = self.model.prompts.get(prompt_kind) or ""
+        return encode_last_token(self.onnx_session, self.tokenizer, [prompt + t for t in texts], self.dim,
+                                 self.max_seq_length, batch_size, show_progress)
+
     def encode(self, texts: list[str], batch_size: int = 64, show_progress: bool = False) -> np.ndarray:
         """Encode document-side texts to L2-normalized float32 vectors, shape (n, dim). Dot product == cosine.
 
         Uses the model's document prompt if it defines one (e.g. "passage: " for e5); a no-op for MiniLM.
         """
+        if self.onnx_session:
+            return self._encode_onnx(texts, "document", batch_size, show_progress)
         return self._encode(self.model.encode_document, texts, batch_size, show_progress)
 
     def encode_queries(self, queries: list[str], batch_size: int = 64) -> np.ndarray:
         """Encode search queries, applying the model's query prompt if it defines one."""
+        if self.onnx_session:
+            return self._encode_onnx(queries, "query", batch_size, False)
         return self._encode(self.model.encode_query, queries, batch_size, False)
 
     def encode_query(self, query: str) -> np.ndarray:

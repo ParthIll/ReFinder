@@ -42,7 +42,8 @@ persistence, API; Frontend owns setup/search/preview UX.
   50 overlap) and `chunk_pieces` (packs whole extractor pieces to ~200 tokens with a 50-token carry-over and keeps
   piece ranges for locations). `MODEL_PROMPTS` adds missing query/document prefixes (bge query instruction, nomic);
   `REMOTE_CODE_MODELS` enables trust_remote_code. `DEFAULT_MODEL` is still `all-MiniLM-L6-v2`; the PRD's MVP model
-  is `BAAI/bge-small-en-v1.5` (384-d).
+  is `BAAI/bge-small-en-v1.5` (384-d). On CPU, models load in float32, and `ONNX_MODELS` (Harrier 270M) run through
+  `refinder/onnx_encoder.py`, which exports to `.cache/onnx/` on first use and falls back to PyTorch on failure.
 - `refinder/extract.py` — bridge that loads `refinder-extractors/` via importlib as `refinder_extractors`, adds
   `.eml`, and turns labelled pieces ("Page 3 Paragraph 2", "Slide 4", "Row 12") into `Piece(text, location)`.
   `extract_text` joins pieces for callers that want one string.

@@ -15,3 +15,5 @@ openpyxl
 python-pptx
 fonttools
 chromadb
+onnx
+onnxruntime
