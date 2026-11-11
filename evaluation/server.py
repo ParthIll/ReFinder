@@ -6,6 +6,7 @@ from typing import Any
 # HTTPException returns clear API errors.
 # Query adds validation to URL query parameters.
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
 
 # BaseModel describes the shape of incoming and outgoing JSON.
 from pydantic import BaseModel
@@ -59,6 +60,14 @@ class FileResponse(BaseModel):
 
 # Create the FastAPI application.
 app = FastAPI(title="ReFinder API")
+
+# The packaged Tauri webview accesses the local API directly.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["tauri://localhost", "http://tauri.localhost", "https://tauri.localhost"],
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type"],
+)
 
 
 # Folder currently loaded into the search engine.
