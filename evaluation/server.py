@@ -308,8 +308,7 @@ def status() -> StatusResponse:
 def list_models() -> ModelsResponse:
     """The embedding models the app offers (refinder/models.py), and the one the index uses."""
     return ModelsResponse(
-        models=[ModelInfo(key=m.key, label=m.label, description=m.description, gpu_recommended=m.gpu_recommended)
-                for m in models.MODELS.values()],
+        models=[ModelInfo(**{f: getattr(m, f) for f in ModelInfo.model_fields}) for m in models.MODELS.values()],
         active=store.model_key() or models.DEFAULT_MODEL, default=models.DEFAULT_MODEL)
 
 

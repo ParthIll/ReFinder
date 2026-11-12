@@ -10,6 +10,7 @@ for the models that have them. Each test set is indexed into a throwaway Chroma 
 
 import argparse
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -38,7 +39,7 @@ def evaluate(spec: models.ModelSpec, ds: dict, embedder: Embedder, work: Path) -
     paths = [str(ds["root"] / p) for p in ds["paths"]]
     store.replace(ds["root"], paths, [[p.text for p in ps] for ps in ds["pieces"]], spec.key)
     t = time.perf_counter()
-    store.embed(embedder, store.generation, _NoLock())
+    store.embed(embedder, store.generation, threading.Lock())
     embed_s = time.perf_counter() - t
     scores, latency = np.zeros((len(ds["queries"]), len(paths))), []
     for i, q in enumerate(ds["queries"]):
@@ -48,14 +49,6 @@ def evaluate(spec: models.ModelSpec, ds: dict, embedder: Embedder, work: Path) -
         latency.append(time.perf_counter() - t)
     return {"ranks": custom.ranks_of_gold(merge_duplicates(scores, ds), ds["queries"]), "embed_s": embed_s, "chunks": store.count(),
             "latency": latency}
-
-
-class _NoLock:
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        return False
 
 
 def main():

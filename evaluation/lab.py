@@ -30,6 +30,7 @@ import numpy as np
 from evaluation import custom
 from evaluation.common import CACHE_DIR, REPO_ROOT as REPO, chunk_corpus, embed_corpus
 from refinder.embedder import Embedder, pick_device
+from refinder.models import sample_chunks
 
 CACHE = CACHE_DIR.parent / "lab"
 CACHE.mkdir(parents=True, exist_ok=True)
@@ -106,13 +107,10 @@ def _header(pieces: list[str]) -> str:
 
 
 def cap_keep(owner: np.ndarray, cap: int) -> np.ndarray:
-    """Chunk ids to keep when a file may have at most `cap` chunks: all of a small file's, evenly spaced ones of a
-    big file's (first and last included). Chunks are contiguous per file."""
+    """Chunk ids to keep when a file may have at most `cap` evenly spaced chunks (chunks are contiguous per file)."""
     starts = np.flatnonzero(np.r_[True, owner[1:] != owner[:-1]]) if len(owner) else np.array([], int)
-    keep = []
-    for s, e in zip(starts, np.r_[starts[1:], len(owner)]):
-        keep.append(np.arange(s, e) if e - s <= cap else s + np.unique(np.linspace(0, e - s - 1, cap).round().astype(int)))
-    return np.concatenate(keep) if keep else np.array([], int)
+    ends = np.r_[starts[1:], len(owner)]
+    return np.array([s + i for s, e in zip(starts, ends) for i in sample_chunks(e - s, cap, "even")], dtype=int)
 
 
 def chunk_index(ds: dict, model: str, index: str = "plain"):
@@ -455,12 +453,17 @@ def parse(v: str):
 SPEED_MARGIN = 0.01  # an indexing shortcut may cost at most 1 Hit@1 point on team and OrgSmith, 1 sample query
 
 
+SETS = (("team", "team"), ("orgsmith", "org/"), ("sample", "sample"))
+
+
 def speed_check(dsets, team, args, cur):
     """Non-inferiority check for changes that make indexing cheaper (no tuning, so no LOMO needed)."""
-    base = {name: pooled(dsets, args.model, cur, prefix) for name, prefix in (("team", "team"), ("orgsmith", "org/"),
-                                                                              ("sample", "sample"))}
-    n_plain = {name: sum(len(index_data(d, args.model, cur["index"])["owner"]) for d in dsets
-                         if d["name"].startswith(prefix)) for name, prefix in (("team", "team"), ("orgsmith", "org/"))}
+    def n_chunks(p):  # chunks embedded for team and OrgSmith
+        return {name: sum(len(index_data(d, args.model, p["index"])["owner"]) for d in dsets
+                          if d["name"].startswith(prefix)) for name, prefix in SETS[:2]}
+
+    base = {name: pooled(dsets, args.model, cur, prefix) for name, prefix in SETS}
+    n_plain = n_chunks(cur)
     print(f"\n== speed check: {args.key} in {args.grid}   (base: {cur[args.key]}, "
           f"team {n_plain['team']:,} chunks, orgsmith {n_plain['orgsmith']:,})")
     for name, (r, _) in base.items():
@@ -468,10 +471,8 @@ def speed_check(dsets, team, args, cur):
         print(f"  base {name:<9} Hit@1 {m['Hit@1']:.3f}  Hit@5 {m['Hit@5']:.3f}  MRR {m['MRR']:.3f}")
     for g in args.grid:
         new = {**cur, args.key: g}
-        out = {name: pooled(dsets, args.model, new, prefix)[0] for name, prefix in (("team", "team"),
-                                                                                  ("orgsmith", "org/"), ("sample", "sample"))}
-        n_new = {name: sum(len(index_data(d, args.model, new["index"])["owner"]) for d in dsets
-                           if d["name"].startswith(prefix)) for name, prefix in (("team", "team"), ("orgsmith", "org/"))}
+        out = {name: pooled(dsets, args.model, new, prefix)[0] for name, prefix in SETS}
+        n_new = n_chunks(new)
         d_team = boot_ci(out["team"], base["team"][0], base["team"][1])
         d_org = boot_ci(out["orgsmith"], base["orgsmith"][0], base["orgsmith"][1])
         d_q = int((out["sample"] <= 1).sum() - (base["sample"][0] <= 1).sum())

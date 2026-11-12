@@ -158,6 +158,14 @@ def _name_words(path: str) -> tuple[list[str], list[str]]:
     return both(p.stem), [w for part in p.parent.parts for w in both(part)]
 
 
+def _where(allowed: np.ndarray | None) -> dict | None:
+    """Chroma filter for the files a search may return: None = all files, {} = none of them."""
+    if allowed is None:
+        return None
+    ids = np.flatnonzero(allowed).tolist()
+    return {"doc_id": {"$in": ids}} if ids else {}
+
+
 def _tied_ranks(order: list[int], score: dict[int, float]) -> dict[int, int]:
     """1-based rank of each id in `order` (sorted best first); equal scores share the best rank, so exact duplicate
     files stay tied after rank fusion."""
@@ -520,14 +528,9 @@ class ChromaIndex:
         if spec.file_vector or spec.reranker:
             return self._dense_ranking_plus(spec, query, query_vec, allowed)
         n = self.count()
-        if query_vec is None or n == 0:
+        where = _where(allowed)
+        if query_vec is None or n == 0 or where == {}:
             return []
-        where = None
-        if allowed is not None:
-            ids = np.flatnonzero(allowed).tolist()
-            if not ids:
-                return []
-            where = {"doc_id": {"$in": ids}}
         raw = self.collection.query(query_embeddings=[np.asarray(query_vec, dtype=np.float32)],
                                     n_results=min(n, DENSE_CANDIDATES), where=where,
                                     include=["documents", "metadatas"])
@@ -543,15 +546,10 @@ class ChromaIndex:
         """Meaning ranking for models with file_vector / reranker. Files found only by their whole-file vector come
         back with empty chunk text (search then shows a keyword snippet for them)."""
         n = self.count()
-        if query_vec is None or n == 0:
+        where = _where(allowed)
+        if query_vec is None or n == 0 or where == {}:
             return []
         q = np.asarray(query_vec, dtype=np.float32)
-        where = None
-        if allowed is not None:
-            ids = np.flatnonzero(allowed).tolist()
-            if not ids:
-                return []
-            where = {"doc_id": {"$in": ids}}
         raw = self.collection.query(query_embeddings=[q], n_results=min(n, DENSE_CANDIDATES), where=where,
                                     include=["documents", "metadatas", "distances"])
         nearest = [(int(m["doc_id"]), d or "", int(m["chunk_index"]), 1.0 - float(dist))
