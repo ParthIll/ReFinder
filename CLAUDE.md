@@ -48,12 +48,15 @@ persistence, API; Frontend owns setup/search/preview UX.
   `extract_text` joins pieces for callers that want one string.
 - `refinder/tree.py` — experimental semantic category tree over files (spherical k-means); `prune` (beam search)
   and `boost` (category-match bonus) search modes.
-- `evaluation/server.py` + `evaluation/database.py` — the FastAPI backend (Sanjay). `ChromaIndex` persists chunks
-  in `evaluation/chroma_db/` (cosine HNSW) plus a `manifest.json` holding every file's extracted text.
-  `/index` is synchronous and rebuilds the whole collection for one folder; no SQLite ledger, no incremental
-  rescan, no delete/rename handling. Search fetches `max(20k, 50)` chunks and keeps the best chunk per file.
-  Note: the API indexes with window `chunk()` and the default model, so it does not yet match what the benchmark
-  measures (paragraph chunking, chosen model, locations).
+- `evaluation/server.py` + `evaluation/database.py` — the FastAPI backend used by the Tauri app (`frontend/`).
+  Hybrid index: `/index` extracts in parallel, builds a BM25 index over full file text and returns (keyword search
+  works immediately), then a background thread embeds up to 20 paragraph chunks per file with bge-small fp16 into
+  Chroma (`evaluation/chroma_db/`). `/status` reports `extracting`/`embedding` progress; `/search` is literal-first:
+  filename match (share of query words, squared; fuzzy) + exact-phrase bonus + RRF(k=60) of BM25 (typo-corrected)
+  and dense (best chunk per file); score scaled to 0-1. `manifest.json` keeps paths + extracted
+  pieces so BM25 is rebuilt on restart (an interrupted embed restarts). Matches `custom.py --models
+  BAAI/bge-small-en-v1.5 --fp16 --max-chunks 20 --hybrid`; team corpus via the API: Hit@1 0.414 / Hit@5 0.755,
+  searchable in ~15 s, fully embedded in ~75 s. Still one folder at a time; no SQLite ledger or incremental rescan.
 - `evaluation/custom.py` — main benchmark: corpus folder + query CSV(s); auto-discovers the team's per-folder
   query CSVs (source_file/corpus_path, secondary_relevant_files, query_type, split). Dense vs BM25, Hit@1/5/10,
   Recall@10, MRR@10, graded nDCG@10, breakdowns by folder/category/file type, latency, `--chunking`, `--tree-*`.

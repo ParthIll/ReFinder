@@ -54,7 +54,7 @@ import numpy as np
 import Stemmer
 
 from evaluation.common import CACHE_DIR, CHUNKING, REPO_ROOT, RESULTS_DIR, chunk_corpus, embed_corpus
-from refinder.embedder import DEFAULT_MODEL, Embedder, pick_device
+from refinder.embedder import CHUNK_OVERLAP, DEFAULT_MODEL, Embedder, pick_device
 from refinder.extract import Piece, UnsupportedFile, describe_location, extract_pieces, pieces_from_text
 from refinder.tree import VectorTree
 
@@ -80,24 +80,45 @@ def extract_cached(p: Path, use_cache: bool) -> list[Piece]:
     return file_pieces
 
 
+def _extract_one(p: Path, use_cache: bool) -> tuple[str, object]:
+    """extract_cached as (status, result), so it can run in a worker process."""
+    try:
+        return "ok", extract_cached(p, use_cache)
+    except UnsupportedFile:
+        return "unsupported", None
+    except Exception as e:  # corrupt PDF, password-protected docx, ...
+        return "failed", f"{type(e).__name__}: {e}"
+
+
 def load_corpus(
-    root: Path, exclude: set[Path] = frozenset(), use_cache: bool = True
+    root: Path, exclude: set[Path] = frozenset(), use_cache: bool = True, workers: int = 1
 ) -> tuple[list[str], list[str], list[list[Piece]], dict]:
-    """Returns (relative paths, texts, pieces, extraction stats) for every supported file under root."""
+    """Returns (relative paths, texts, pieces, extraction stats) for every supported file under root.
+
+    workers > 1 extracts files in parallel processes (parsing is CPU-bound and one file at a time otherwise).
+    """
     paths, texts, pieces, skipped, empty, failed = [], [], [], Counter(), [], {}
     t0 = time.perf_counter()
-    for p in sorted(root.rglob("*")):
-        if not p.is_file() or p.resolve() in exclude:
-            continue
+    files = [p for p in sorted(root.rglob("*")) if p.is_file() and p.resolve() not in exclude]
+    if workers > 1:
+        from concurrent.futures import ProcessPoolExecutor
+
+        with ProcessPoolExecutor(workers) as pool:
+            # Biggest files first so one huge PDF doesn't start last and leave the other workers idle.
+            order = sorted(range(len(files)), key=lambda i: -files[i].stat().st_size)
+            done = dict(zip(order, pool.map(_extract_one, [files[i] for i in order], [use_cache] * len(files))))
+        results = [done[i] for i in range(len(files))]
+    else:
+        results = [_extract_one(p, use_cache) for p in files]
+    for p, (status, result) in zip(files, results):
         rel = p.relative_to(root).as_posix()
-        try:
-            file_pieces = extract_cached(p, use_cache)
-        except UnsupportedFile:
+        if status == "unsupported":
             skipped[p.suffix.lower() or p.name] += 1
             continue
-        except Exception as e:  # corrupt PDF, password-protected docx, ...
-            failed[rel] = f"{type(e).__name__}: {e}"
+        if status == "failed":
+            failed[rel] = result
             continue
+        file_pieces = result
         text = "\n\n".join(piece.text for piece in file_pieces)
         if not text:
             empty.append(rel)
@@ -290,16 +311,19 @@ def latency_stats(samples_ms: list[float]) -> dict[str, float]:
 # ---------------------------------------------------------------- retrievers
 
 class DenseRetriever:
-    def __init__(self, model_name: str, texts: list[str], pieces: list[list[Piece]], chunking: str, use_cache: bool):
+    def __init__(self, model_name: str, texts: list[str], pieces: list[list[Piece]], chunking: str, use_cache: bool,
+                 fp16: bool = False, overlap: int = CHUNK_OVERLAP, max_chunks: int = 0):
         t0 = time.perf_counter()
-        self.embedder = Embedder(model_name)
+        self.embedder = Embedder(model_name, fp16=fp16)
         self.load_s = time.perf_counter() - t0
         print(f"\n[{model_name} | {chunking} chunks] dim={self.embedder.dim} device={self.embedder.model.device} "
               f"(loaded in {self.load_s:.1f}s)")
         self.n_files = len(texts)
         self.pieces = pieces
+        self.overlap, self.max_chunks = overlap, max_chunks  # rerankers re-chunk with the same settings
         self.vecs, self.owner, self.spans, self.index_stats = embed_corpus(
-            self.embedder, texts, use_cache=use_cache, pieces=[[p.text for p in ps] for ps in pieces], chunking=chunking
+            self.embedder, texts, use_cache=use_cache, pieces=[[p.text for p in ps] for ps in pieces], chunking=chunking,
+            overlap=overlap, max_chunks=max_chunks,
         )
         owner = self.owner
         # Chunks are contiguous per file, so a file's score is the max over its slice of chunk scores.
@@ -471,7 +495,8 @@ class RerankRetriever:
         # retriever because every reranker variant over it needs the same texts.
         if not hasattr(dense, "chunk_texts"):
             dense.chunk_texts, _, _ = chunk_corpus(dense.embedder, texts,
-                                                   [[p.text for p in ps] for ps in dense.pieces], chunking)
+                                                   [[p.text for p in ps] for ps in dense.pieces], chunking,
+                                                   dense.overlap, dense.max_chunks)
         self.chunk_texts = dense.chunk_texts
         self.labels = [f"{Path(p).parent.name}/{Path(p).stem}\n" if names else "" for p in paths]
         # Chunks are contiguous per file: file f owns chunk ids span[f][0]:span[f][1].
@@ -554,6 +579,26 @@ class BM25Retriever:
         return np.argsort(-s)[:k]
 
 
+class HybridRetriever:
+    """Reciprocal rank fusion of a dense retriever and BM25: a file scores sum(1 / (k + its rank)) over both lists,
+    so it rises if either method ranks it well. k=60 is the usual constant from the RRF paper."""
+
+    def __init__(self, dense, bm25: "BM25Retriever", k: int = 60):
+        self.dense, self.bm25, self.k = dense, bm25, k
+        self.n_files = dense.n_files
+        self.index_stats = dict(dense.index_stats, bm25_index_s=bm25.index_stats["index_s"])
+
+    def _rrf(self, scores: np.ndarray) -> np.ndarray:
+        ranks = np.argsort(np.argsort(-scores, axis=1), axis=1) + 1
+        return 1.0 / (self.k + ranks)
+
+    def all_scores(self, queries: list[str]) -> np.ndarray:
+        return self._rrf(self.dense.all_scores(queries)) + self._rrf(self.bm25.all_scores(queries))
+
+    def search(self, query: str, k: int = 10) -> np.ndarray:
+        return np.argsort(-self.all_scores([query])[0])[:k]
+
+
 def time_queries(retriever, queries: list[str]) -> dict[str, float]:
     sample = (queries * (LATENCY_RUNS // max(len(queries), 1) + 1))[:LATENCY_RUNS]
     for q in sample[:5]:  # warm-up (first MPS/CUDA calls compile kernels)
@@ -613,6 +658,14 @@ def main() -> None:
                     help="prefix passages with folder/filename for the reranker")
     ap.add_argument("--no-bm25", action="store_true")
     ap.add_argument("--distractors", type=int, default=0, help="add N unlabeled Kaggle web-text files as noise")
+    ap.add_argument("--hybrid", action="store_true", help="also fuse each embedding model with BM25 (reciprocal rank)")
+    ap.add_argument("--max-chunks", type=int, default=0,
+                    help="embed at most this many chunks per file (BM25 still sees all text); 0 = no cap")
+    ap.add_argument("--fp16", action="store_true", help="run the embedding model in half precision (GPU/MPS only)")
+    ap.add_argument("--overlap", type=int, default=CHUNK_OVERLAP, help="tokens carried over between chunks")
+    ap.add_argument("--workers", type=int, default=1, help="extract files in this many parallel processes")
+    ap.add_argument("--fresh-embed", action="store_true",
+                    help="re-embed even if cached (times indexing) but reuse cached text extraction")
     ap.add_argument("--fresh", action="store_true",
                     help="re-extract and re-embed even if cached, so extraction and indexing speed are measured")
     args = ap.parse_args()
@@ -626,7 +679,7 @@ def main() -> None:
 
     paths, texts, pieces, corpus_stats = load_corpus(
         args.corpus, exclude=query_file_exclusions(query_csvs) | {(args.corpus / e).resolve() for e in args.exclude},
-        use_cache=not args.fresh
+        use_cache=not args.fresh, workers=args.workers
     )
     if args.distractors:
         d_paths, d_texts, d_pieces = load_distractors(args.distractors)
@@ -662,7 +715,8 @@ def main() -> None:
 
     def dense(m: str, c: str) -> DenseRetriever:
         if (m, c) not in dense_cache:
-            dense_cache[(m, c)] = DenseRetriever(m, texts, pieces, c, use_cache=not args.fresh)
+            dense_cache[(m, c)] = DenseRetriever(m, texts, pieces, c, use_cache=not (args.fresh or args.fresh_embed),
+                                                  fp16=args.fp16, overlap=args.overlap, max_chunks=args.max_chunks)
         return dense_cache[(m, c)]
 
     def tree(m: str, c: str, parts: int, **mode) -> TreeRetriever:
@@ -682,11 +736,20 @@ def main() -> None:
         t, build_s = tree_cache[(m, c, parts)]
         return TreeRetriever(d, t, build_s, **mode)
 
+    bm25_cache = []
+
+    def bm25() -> BM25Retriever:
+        if not bm25_cache:
+            bm25_cache.append(BM25Retriever(texts))
+        return bm25_cache[0]
+
     retrievers = []
     for m in args.models:
         for c in args.chunking:
-            name = f"{m.split('/')[-1]} [{c}]"
+            name = f"{m.split('/')[-1]} [{c}]" + (f" cap{args.max_chunks}" if args.max_chunks else "")
             retrievers.append((name, lambda m=m, c=c: dense(m, c)))
+            if args.hybrid:
+                retrievers.append((f"{name} + bm25", lambda m=m, c=c: HybridRetriever(dense(m, c), bm25())))
             for p in args.tree_parts:
                 suffix = f" p={p}" if len(args.tree_parts) > 1 else ""
                 retrievers += [(f"{name} tree b={b}{suffix}", lambda m=m, c=c, p=p, b=b: tree(m, c, p, beam=b))
@@ -711,7 +774,7 @@ def main() -> None:
                                        dense(m, c), texts, paths, c, rm, args.rerank_depth, mode, w, nm == "on", fu,
                                        FileScoreRetriever(dense(m, c), fv0, sp0) if fv0 or sp0 else None)))
     if not args.no_bm25:
-        retrievers.append(("bm25", lambda: BM25Retriever(texts)))
+        retrievers.append(("bm25", bm25))
 
     report, per_query = {}, {}
     for name, build in retrievers:
@@ -723,9 +786,10 @@ def main() -> None:
         per_query[name] = (ranks, top3, matches)
         routing = r.routing(queries) if isinstance(r, TreeRetriever) else None
         speed = {"index": r.index_stats, "search": time_queries(r, q_texts)}
-        if isinstance(r, DenseRetriever):
-            speed["model_load_s"] = r.load_s
-            speed["index_mb"] = r.vecs.nbytes / 1e6
+        dr = getattr(r, "dense", r)  # a hybrid wraps its dense retriever
+        if isinstance(dr, DenseRetriever):
+            speed["model_load_s"] = dr.load_s
+            speed["index_mb"] = dr.vecs.nbytes / 1e6
         report[name] = {"accuracy": breakdowns(ranks, nd, rc, queries, paths), "speed": speed}
         if routing:
             report[name]["routing"] = routing

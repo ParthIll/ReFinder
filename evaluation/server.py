@@ -1,54 +1,64 @@
-# Path helps us work with and validate folder paths.
+"""ReFinder local API (FastAPI). Run: uvicorn evaluation.server:app --host 127.0.0.1 --port 8000
+
+Indexing a folder:  extract text (parallel processes) -> BM25 keyword index (searchable now) -> background thread
+embeds a capped sample of paragraph chunks per file with bge-small into Chroma. Search fuses BM25 and vector
+rankings (see evaluation/database.py), so results improve while embedding runs.
+"""
+
+import os
+import threading
 from pathlib import Path
 from typing import Any
 
-# FastAPI creates the API.
-# HTTPException returns clear API errors.
-# Query adds validation to URL query parameters.
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-
-# BaseModel describes the shape of incoming and outgoing JSON.
 from pydantic import BaseModel
 
-from evaluation.database import ChromaIndex
+from evaluation.database import Cancelled, ChromaIndex
+
+# Fastest model at good accuracy in the benchmark; fp16 is ~1.3x faster on GPU/MPS with the same results.
+MODEL_NAME = "BAAI/bge-small-en-v1.5"
+# Process start-up costs a few seconds, so small folders extract in-process.
+PARALLEL_MIN_FILES = 200
+
 
 # ---------------------------------------------------------
 # Request and response models
 # ---------------------------------------------------------
 
-# JSON the client sends when asking us to index a folder.
 class IndexRequest(BaseModel):
     folder: str
 
 
-# JSON returned after indexing a folder.
 class IndexResponse(BaseModel):
     status: str
     files_queued: int
+    failed: int
+    extract_s: float
 
 
-# One individual search result.
 class SearchResult(BaseModel):
     path: str
+    # 0-1 relevance from rank fusion: 1.0 = ranked first by both keyword and meaning search.
     score: float
     snippet: str
     chunk_id: int | None
 
 
-# The complete response returned by /search.
 class SearchResponse(BaseModel):
     results: list[SearchResult]
 
 
-# Information returned by /status.
 class StatusResponse(BaseModel):
     indexed_files: int
     chunks: int
+    # idle | extracting | embedding | error
     state: str
+    embedded_chunks: int
+    total_chunks: int
+    error: str | None = None
 
 
-# File contents returned by /file.
 class FileResponse(BaseModel):
     path: str
     text: str
@@ -58,7 +68,6 @@ class FileResponse(BaseModel):
 # Application and server memory
 # ---------------------------------------------------------
 
-# Create the FastAPI application.
 app = FastAPI(title="ReFinder API")
 
 # The packaged Tauri webview accesses the local API directly.
@@ -69,194 +78,144 @@ app.add_middleware(
     allow_headers=["Content-Type"],
 )
 
-
-# Folder currently loaded into the search engine.
-# None means no folder has been indexed yet.
 corpus_root: Path | None = None
-
-# Relative paths of all indexed files.
 paths: list[str] = []
-
-# Extracted text from each indexed file.
-# texts[0] belongs to paths[0], and so on.
 texts: list[str] = []
 
-# Persistent Chroma store. Survives process restarts.
 store = ChromaIndex()
-
-# Embedding model used to encode queries. Loaded on first index or search.
 embedder: Any | None = None
-
-# Current state of the indexing process.
+model_lock = threading.Lock()  # one model, used by the embedding thread and by query encoding
+index_lock = threading.Lock()  # one /index at a time
 index_state = "idle"
+index_error: str | None = None
+
+
+def _get_embedder():
+    """Load the sentence-transformer on first use (a few seconds)."""
+    global embedder
+    with model_lock:
+        if embedder is None:
+            from refinder.embedder import Embedder
+
+            embedder = Embedder(store.model_name() or MODEL_NAME, fp16=True)
+    return embedder
+
+
+def _embed_in_background(generation: int) -> None:
+    global index_state, index_error
+    try:
+        store.embed(_get_embedder(), generation, model_lock)
+    except Cancelled:
+        return  # a newer /index owns the state now
+    except Exception as e:  # keep keyword search working even if embedding fails
+        if generation == store.generation:
+            index_state, index_error = "error", f"Embedding failed: {type(e).__name__}: {e}"
+        return
+    if generation == store.generation:
+        index_state = "idle"
+
+
+def _start_embedding() -> None:
+    global index_state, index_error
+    index_state, index_error = "embedding", None
+    threading.Thread(target=_embed_in_background, args=(store.generation,), daemon=True).start()
 
 
 def _restore_from_disk() -> None:
-    """Reload paths and texts from a previously written Chroma index."""
+    """Reload the last index; finish embedding it if the server stopped part way."""
     global corpus_root, paths, texts
     loaded = store.load()
     if loaded is None:
         return
     corpus_root, paths, texts = loaded
-
-
-def _get_embedder():
-    """Load the sentence-transformer only when indexing or searching needs it."""
-    global embedder
-    if embedder is None:
-        from refinder.embedder import DEFAULT_MODEL, Embedder
-
-        embedder = Embedder(store.model_name() or DEFAULT_MODEL)
-    return embedder
+    if not store.embedding_complete():
+        store.build_keyword(corpus_root, paths, store.manifest["pieces"], store.model_name() or MODEL_NAME)
+        _start_embedding()
 
 
 _restore_from_disk()
 
 
 # ---------------------------------------------------------
-# Index endpoint
+# Endpoints
 # ---------------------------------------------------------
 
-# Accept a JSON body such as:
-# {"folder": "evaluation/sample/Corpus"}
 @app.post("/index", response_model=IndexResponse)
 def index_folder(request: IndexRequest) -> IndexResponse:
-    # We assign new values to these module-level variables.
-    global corpus_root, paths, texts, index_state
+    """Index a folder, replacing the current index. Returns once keyword search is ready; embedding continues in
+    the background (poll /status)."""
+    global corpus_root, paths, texts, index_state, index_error, embedder
 
-    # Import extraction only when indexing is requested.
     from evaluation.custom import load_corpus
 
-    # Convert the provided folder into a complete absolute path.
-    # expanduser() supports paths beginning with "~".
     folder = Path(request.folder).expanduser().resolve()
-
-    # Stop and return HTTP 404 if the folder does not exist.
     if not folder.is_dir():
-        raise HTTPException(
-            status_code=404,
-            detail="Folder not found",
-        )
-
-    # Tell /status that indexing is currently happening.
-    index_state = "indexing"
-
+        raise HTTPException(status_code=404, detail="Folder not found")
+    if not index_lock.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail="Already indexing a folder")
     try:
-        # Read supported files and extract their text.
-        # new_paths contains filenames.
-        # new_texts contains the corresponding file contents.
-        # stats contains extraction statistics.
-        new_paths, new_texts, _pieces, stats = load_corpus(folder)
-
-        # Do not create an empty search index.
+        index_state, index_error = "extracting", None
+        n_files = sum(1 for p in folder.rglob("*") if p.is_file())
+        workers = min(8, os.cpu_count() or 1) if n_files >= PARALLEL_MIN_FILES else 1
+        new_paths, new_texts, new_pieces, stats = load_corpus(folder, workers=workers)
         if not new_paths:
-            raise HTTPException(
-                status_code=400,
-                detail="Folder contains no supported files",
-            )
+            index_state = "idle"
+            raise HTTPException(status_code=400, detail="Folder contains no supported files")
 
-        # Chunk, embed, and persist vectors in ChromaDB.
-        store.replace(folder, new_paths, new_texts, _get_embedder())
-
-        # Keep extracted text in memory for /file and /status.
-        corpus_root = folder
-        paths = new_paths
-        texts = new_texts
-
+        if embedder is not None and embedder.model_name != MODEL_NAME:
+            embedder = None  # index built with an older model: switch to the current one
+        store.build_keyword(folder, new_paths, [[p.text for p in ps] for ps in new_pieces], MODEL_NAME)
+        corpus_root, paths, texts = folder, new_paths, new_texts
+        _start_embedding()
+    except HTTPException:
+        raise
+    except Exception as e:
+        index_state, index_error = "error", f"{type(e).__name__}: {e}"
+        raise HTTPException(status_code=500, detail=index_error)
     finally:
-        # Return to idle whether indexing succeeds or fails.
-        index_state = "idle"
+        index_lock.release()
 
-    # Send a JSON response to the caller.
-    return IndexResponse(
-        status="completed",
-        files_queued=len(paths),
-    )
+    return IndexResponse(status="searchable", files_queued=len(paths), failed=len(stats["failed"]),
+                         extract_s=round(stats["extract_s"], 2))
 
 
-# ---------------------------------------------------------
-# Search endpoint
-# ---------------------------------------------------------
-
-# Example request:
-# GET /search?q=notes about taxes&k=5
 @app.get("/search", response_model=SearchResponse)
-def search(
-    # The user's natural-language search.
-    q: str,
-
-    # Number of results to return.
-    # FastAPI only allows values from 1 through 20.
-    k: int = Query(default=5, ge=1, le=20),
-) -> SearchResponse:
-
-    # Searching is impossible before a folder is indexed.
+def search(q: str, k: int = Query(default=5, ge=1, le=20),
+           mode: str = Query(default="smart", pattern="^(smart|keyword)$")) -> SearchResponse:
+    """mode=smart: filename + phrase + keyword + meaning. mode=keyword: plain BM25 keyword match only."""
     if not store.ready():
-        raise HTTPException(
-            status_code=409,
-            detail="Index a folder before searching",
-        )
-
-    hits = store.search(_get_embedder().encode_query(q), k=k)
-    return SearchResponse(
-        results=[
-            SearchResult(
-                path=hit["path"],
-                score=float(hit["score"]),
-                snippet=hit["snippet"],
-                chunk_id=hit["chunk_id"],
-            )
-            for hit in hits
-        ]
-    )
+        raise HTTPException(status_code=409, detail="Index a folder before searching")
+    if mode == "keyword":
+        return SearchResponse(results=[SearchResult(**hit) for hit in store.keyword_search(q, k=k)])
+    query_vec = None
+    if store.count():  # skip loading the model while only keyword search is available
+        enc = _get_embedder()
+        with model_lock:
+            query_vec = enc.encode_query(q)
+    return SearchResponse(results=[SearchResult(**hit) for hit in store.search(q, query_vec, k=k)])
 
 
-# ---------------------------------------------------------
-# Status endpoint
-# ---------------------------------------------------------
-
-# Example request:
-# GET /status
 @app.get("/status", response_model=StatusResponse)
 def status() -> StatusResponse:
     return StatusResponse(
         indexed_files=len(paths),
         chunks=store.count(),
         state=index_state,
+        embedded_chunks=store.embedded_chunks,
+        total_chunks=store.total_chunks,
+        error=index_error,
     )
 
 
-# ---------------------------------------------------------
-# File endpoint
-# ---------------------------------------------------------
-
-# Example request:
-# GET /file?path=finance/taxes/2025_tax_notes.txt
 @app.get("/file", response_model=FileResponse)
 def get_file(path: str) -> FileResponse:
     try:
-        # Find where this filename appears in paths.
         index = paths.index(path)
-
     except ValueError:
-        # paths.index() raises ValueError when the path is absent.
-        raise HTTPException(
-            status_code=404,
-            detail="Indexed file not found",
-        )
-
-    # Use the same index to retrieve the matching text.
-    return FileResponse(
-        path=paths[index],
-        text=texts[index],
-    )
+        raise HTTPException(status_code=404, detail="Indexed file not found")
+    return FileResponse(path=paths[index], text=texts[index])
 
 
-# ---------------------------------------------------------
-# Health endpoint
-# ---------------------------------------------------------
-
-# A simple way to verify that the server is running.
 @app.get("/")
 def health() -> dict[str, str]:
     return {"status": "ReFinder API is running"}
