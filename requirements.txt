@@ -17,3 +17,7 @@ fonttools
 chromadb
 rapidfuzz
 watchdog
+pytesseract
+pillow
+httpx
+mcp

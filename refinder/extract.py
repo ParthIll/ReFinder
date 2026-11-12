@@ -79,11 +79,12 @@ def _ints(**groups: str | None) -> dict:
 # Label formats per file type, as written by refinder-extractors. Only applied to the matching suffixes so a
 # .txt paragraph that happens to start with "Row 5:" isn't misread.
 LABELS: dict[str, tuple[re.Pattern, Callable[[re.Match], dict]]] = {
-    ".pdf": (re.compile(r"^Page (\d+)(?: Paragraph (\d+))?\n"), lambda m: _ints(page=m[1], paragraph=m[2])),
+    ".pdf": (re.compile(r"^Page (\d+)(?: Paragraph (\d+)| Image (\d+))?\n"),
+             lambda m: _ints(page=m[1], paragraph=m[2], image=m[3])),
     ".pptx": (re.compile(r"^Slide (\d+)\n"), lambda m: _ints(slide=m[1])),
     ".csv": (re.compile(r"^Row (\d+): "), lambda m: _ints(row=m[1])),
     ".tsv": (re.compile(r"^Row (\d+): "), lambda m: _ints(row=m[1])),
-    ".docx": (re.compile(r"^Table (\d+):\n"), lambda m: _ints(table=m[1])),
+    ".docx": (re.compile(r"^(?:Table (\d+)|Image (\d+)):\n"), lambda m: _ints(table=m[1], image=m[2])),
     # Keep the sheet name in the text (it's often meaningful, e.g. "Budget 2026"); drop only the cell range.
     ".xlsx": (re.compile(r"^(Sheet: .*?); Range: ([A-Z]+\d+:[A-Z]+\d+)\n"), lambda m: {"sheet": m[1][7:], "range": m[2]}),
 }
