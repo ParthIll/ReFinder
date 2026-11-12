@@ -61,6 +61,7 @@ class SearchResult(BaseModel):
     # The full matched passage (best chunk or paragraph), for highlighting it in the preview.
     passage: str = ""
     chunk_id: int | None
+    visual_match: dict[str, int] | None = None
     # Unix seconds; "added" is macOS Date Added (falls back to creation time).
     modified: float
     added: float
@@ -83,6 +84,8 @@ class StatusResponse(BaseModel):
     state: str
     embedded_chunks: int
     total_chunks: int
+    embedded_images: int = 0
+    total_images: int = 0
     error: str | None = None
     # The indexed folder (absolute path), if any; `folders` lists every indexed folder.
     folder: str | None = None
@@ -125,6 +128,7 @@ app.add_middleware(
 
 store = ChromaIndex()
 embedder: Any | None = None
+visual_embedder: Any | None = None
 model_lock = threading.Lock()  # one model, used by the embedding thread and by query encoding
 index_lock = threading.Lock()  # one /index at a time
 index_state = "idle"
@@ -142,18 +146,34 @@ def _get_embedder():
     return embedder
 
 
+def _get_visual_embedder():
+    """Only load MobileCLIP when at least one OCR-fallback image needs indexing/search."""
+    global visual_embedder
+    with model_lock:
+        if visual_embedder is None:
+            from refinder.vision import VisualEmbedder
+
+            visual_embedder = VisualEmbedder()
+    return visual_embedder
+
+
 def _embed_in_background(generation: int) -> None:
     global index_state, index_error
+    errors = []
     try:
-        store.embed(_get_embedder(), generation, model_lock)
+        store.embed(_get_embedder() if store.pending_text() else None, generation, model_lock)
     except Cancelled:
         return  # a newer /index owns the state now
     except Exception as e:  # keep keyword search working even if embedding fails
-        if generation == store.generation:
-            index_state, index_error = "error", f"Embedding failed: {type(e).__name__}: {e}"
+        errors.append(f"Text embedding failed: {type(e).__name__}: {e}")
+    try:
+        store.embed_visuals(_get_visual_embedder, generation, model_lock)
+    except Cancelled:
         return
+    except Exception as e:
+        errors.append(f"Visual embedding failed: {type(e).__name__}: {e}")
     if generation == store.generation:
-        index_state = "idle"
+        index_state, index_error = ("error", "; ".join(errors)) if errors else ("idle", None)
 
 
 def _start_embedding() -> None:
@@ -162,9 +182,10 @@ def _start_embedding() -> None:
     threading.Thread(target=_embed_in_background, args=(store.generation,), daemon=True).start()
 
 
-def _extract(paths_by_root: dict[int, list[Path]]) -> list[tuple[int, str, list[str]]]:
+def _extract(paths_by_root: dict[int, list[Path]]) -> list[tuple[int, str, list[str], list[dict]]]:
     """(root index, absolute path, piece texts) for each file that extracts; failures are left out."""
     from evaluation.custom import load_corpus
+    from refinder.extract import visual_assets
 
     out = []
     roots = store.roots()
@@ -172,7 +193,7 @@ def _extract(paths_by_root: dict[int, list[Path]]) -> list[tuple[int, str, list[
         root = Path(roots[r])
         workers = min(8, os.cpu_count() or 1) if len(files) >= PARALLEL_MIN_FILES else 1
         rel, _, pieces, _ = load_corpus(root, workers=workers, files=files, use_cache=USE_EXTRACT_CACHE)
-        out += [(r, str(root / p), [x.text for x in ps]) for p, ps in zip(rel, pieces)]
+        out += [(r, str(root / p), [x.text for x in ps if x.text.strip()], visual_assets(ps)) for p, ps in zip(rel, pieces)]
     return out
 
 
@@ -235,7 +256,8 @@ def reconcile(files: set[str], folders: set[str]) -> bool:
             by_root.setdefault(current[p], []).append(Path(p))
         try:
             added = _extract(by_root)
-            store.apply_changes(added, removed + changed)
+            store.apply_changes([(r, p, pieces) for r, p, pieces, _ in added], removed + changed,
+                                visuals=[assets for _, _, _, assets in added])
         except Exception as e:
             index_state, index_error = prev_state, None
             log.warning("Index update failed: %s: %s", type(e).__name__, e)
@@ -310,6 +332,7 @@ def index_folder(request: IndexRequest) -> IndexResponse:
     global index_state, index_error, embedder
 
     from evaluation.custom import list_files, load_corpus
+    from refinder.extract import visual_assets
 
     folder = Path.home() if request.whole_computer else Path(request.folder).expanduser().resolve()
     if not folder.is_dir():
@@ -335,13 +358,14 @@ def index_folder(request: IndexRequest) -> IndexResponse:
             index_state = prev_state if adding else "idle"
             raise HTTPException(status_code=400, detail="Folder contains no supported files")
         abs_paths = [str(folder / p) for p in new_paths]
-        piece_texts = [[p.text for p in ps] for ps in new_pieces]
+        piece_texts = [[p.text for p in ps if p.text.strip()] for ps in new_pieces]
+        visuals = [visual_assets(ps) for ps in new_pieces]
         if adding:
-            store.add(folder, abs_paths, piece_texts, whole=request.whole_computer)
+            store.add(folder, abs_paths, piece_texts, whole=request.whole_computer, visuals=visuals)
         else:
             if embedder is not None and embedder.model_name != MODEL_NAME:
                 embedder = None  # index built with an older model: switch to the current one
-            store.replace(folder, abs_paths, piece_texts, MODEL_NAME, whole=request.whole_computer)
+            store.replace(folder, abs_paths, piece_texts, MODEL_NAME, whole=request.whole_computer, visuals=visuals)
         _start_embedding()
         _sync_watching()
     except HTTPException:
@@ -404,6 +428,18 @@ def _encode(text: str):
         return enc.encode_query(text)
 
 
+def _encode_visual(text: str):
+    if not store.visual_count():
+        return None
+    try:
+        encoder = _get_visual_embedder()
+        with model_lock:
+            return encoder.encode_query(text)
+    except Exception as exc:
+        log.warning("Visual search unavailable: %s: %s", type(exc).__name__, exc)
+        return None  # the filename, keyword and text searches remain usable
+
+
 @app.get("/search", response_model=SearchResponse)
 def search(
     q: str = "",
@@ -433,7 +469,8 @@ def search(
         # a small boost for files of that type or date.
         # "recent"/"latest" only ask for newer files, so they are left out of the text itself.
         text = " ".join(RECENT.sub(" ", q).split()) if meta.recent else q
-        hits = store.search(text or q, _encode(text or q), k=k, filters=filters, meta=meta)
+        hits = store.search(text or q, _encode(text or q), k=k, filters=filters, meta=meta,
+                            visual_vec=_encode_visual(text or q))
     return SearchResponse(results=[SearchResult(**hit) for hit in hits], understood=meta.labels)
 
 
@@ -454,6 +491,8 @@ def status() -> StatusResponse:
         state=index_state,
         embedded_chunks=store.embedded_chunks,
         total_chunks=store.total_chunks,
+        embedded_images=store.embedded_images,
+        total_images=store.total_images,
         error=index_error,
         folder=roots[0] if len(roots) == 1 else None,
         folders=roots,

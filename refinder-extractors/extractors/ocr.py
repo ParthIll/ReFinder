@@ -5,6 +5,7 @@ Needs the `tesseract` program installed (brew install tesseract), plus the pytes
 import hashlib
 import re
 import unicodedata
+from collections.abc import Callable
 from pathlib import Path
 
 import pytesseract
@@ -17,8 +18,12 @@ OCR_MIN_SIDE = 1000  # Small images OCR poorly, so upscale until the shorter sid
 EMBEDDED_MIN_SIDE = 100  # Skip logos, bullets, and other decorative images inside documents.
 
 
-def ocr_image(img: Image.Image) -> str:
-    """OCR one open PIL image. Returns "" when no readable text is found."""
+def ocr_image(img: Image.Image, on_fallback: Callable | None = None) -> str:
+    """OCR one image; retain good words even when mean confidence is low.
+
+    Optional on_fallback(image, info) handles empty/low-confidence OCR or engine
+    failures. Without it, the extractor's original error behavior is preserved.
+    """
     # Phone photos store rotation in EXIF metadata; apply it so text reads upright.
     img = ImageOps.exif_transpose(img)
     gray = ImageOps.grayscale(img)
@@ -30,26 +35,47 @@ def ocr_image(img: Image.Image) -> str:
         new_size = (round(gray.width * scale), round(gray.height * scale))
         gray = gray.resize(new_size, Image.LANCZOS)
 
-    data = pytesseract.image_to_data(gray, output_type=Output.DICT)
-    return _clean_ocr(_words_to_lines(data))
+    try:
+        data = pytesseract.image_to_data(gray, output_type=Output.DICT)
+    except (pytesseract.TesseractNotFoundError, pytesseract.TesseractError, RuntimeError) as exc:
+        if on_fallback is None:
+            raise
+        on_fallback(img, {"ocr_confidence": 0.0, "ocr_error": f"{type(exc).__name__}: {exc}"[:500]})
+        return ""
+    text = _clean_ocr(_words_to_lines(data))
+    confidences = []
+    for word, raw in zip(data["text"], data["conf"]):
+        if not word.strip():
+            continue
+        try:
+            confidence = float(raw)
+        except (ValueError, TypeError):
+            continue
+        if confidence >= 0:
+            confidences.append(confidence)
+    confidence = sum(confidences) / len(confidences) if confidences else 0.0
+    if on_fallback is not None and (not text or confidence < OCR_MIN_CONF):
+        on_fallback(img, {"ocr_confidence": round(confidence, 2)})
+    return text
 
 
-def ocr_embedded(img: Image.Image, seen: set[str]) -> str:
+def ocr_embedded(img: Image.Image, seen: set[str], on_fallback: Callable | None = None) -> str:
     """OCR an image found inside a document. Returns "" for tiny images, for images already OCR'd in this
     file (`seen` holds their digests, so a logo repeated on every page is read once), and for no text."""
     if min(img.size) < EMBEDDED_MIN_SIDE:
         return ""
-    digest = hashlib.sha256(img.tobytes()).hexdigest()
+    digest = hashlib.sha256(f"{img.mode}:{img.size}".encode() + img.tobytes()).hexdigest()
     if digest in seen:
         return ""
     seen.add(digest)
-    return ocr_image(img)
+    return ocr_image(img, on_fallback=on_fallback)
 
 
-def extract_image(path: Path) -> list[str]:
+def extract_image(path: Path, on_visual: Callable | None = None) -> list[str]:
     """Standalone image file: one piece with all of its text, or nothing if it has none."""
     with Image.open(path) as img:
-        text = ocr_image(img)
+        text = ocr_image(img, on_fallback=(lambda image, info: on_visual(image, {"image": 1}, info))
+                         if on_visual else None)
     return [text] if text else []
 
 

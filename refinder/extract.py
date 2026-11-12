@@ -70,6 +70,7 @@ class UnsupportedFile(Exception):
 class Piece:
     text: str
     location: dict  # always has "piece" (1-based order in the file); plus page/paragraph/slide/row/table/sheet/range
+    visual: dict | None = None  # OCR fallback asset; kept separate from the text sent to the language model
 
 
 def _ints(**groups: str | None) -> dict:
@@ -105,12 +106,34 @@ def extract_pieces(path: Path) -> list[Piece]:
     if suffix not in SUPPORTED_SUFFIXES or path.name.startswith(("~$", ".")):
         raise UnsupportedFile(f"skipped type {suffix or path.name}")
     pieces = []
-    raw_pieces = LOCAL_EXTRACTORS[suffix](path) if suffix in LOCAL_EXTRACTORS else extract(path)
+    visuals = []
+    from refinder.vision import VISUAL_SUFFIXES, capture_asset
+
+    def on_visual(image, location, info):
+        visuals.append(capture_asset(image, location, info))
+
+    if suffix == ".pdf":
+        from refinder_extractors.extractors.pdf import extract_pdf
+        raw_pieces = extract_pdf(path, on_visual=on_visual)
+    elif suffix == ".docx":
+        from refinder_extractors.extractors.word import extract_docx
+        raw_pieces = extract_docx(path, on_visual=on_visual)
+    elif suffix in VISUAL_SUFFIXES:
+        from refinder_extractors.extractors.ocr import extract_image
+        raw_pieces = extract_image(path, on_visual=on_visual)
+    else:
+        raw_pieces = LOCAL_EXTRACTORS[suffix](path) if suffix in LOCAL_EXTRACTORS else extract(path)
     for i, raw in enumerate(raw_pieces, 1):
         text, location = _strip_label(raw, suffix)
         if text.strip():
             pieces.append(Piece(text, {"piece": i, **location}))
+    for asset in visuals:
+        pieces.append(Piece("", {"piece": len(pieces) + 1, **{k: asset[k] for k in ("page", "image") if k in asset}}, asset))
     return pieces
+
+
+def visual_assets(pieces: list[Piece]) -> list[dict]:
+    return [p.visual for p in pieces if getattr(p, "visual", None) is not None]
 
 
 def pieces_from_text(text: str) -> list[Piece]:

@@ -30,6 +30,8 @@ RENDERED = {".pdf": "pdf", ".docx": "docx"}
 def preview(path: Path, text: str) -> dict[str, Any]:
     """{"kind": "pdf" | "docx" | "table" | "slides" | "text", ...}. `text` is the extracted text (fallback)."""
     suffix = path.suffix.lower()
+    if suffix in {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}:
+        return {"kind": "image"}
     if suffix in RENDERED:
         return {"kind": RENDERED[suffix]}
     try:

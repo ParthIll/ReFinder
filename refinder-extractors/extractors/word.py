@@ -13,8 +13,10 @@ from .ocr import ocr_embedded
 
 
 def _embedded_images(doc) -> Iterator[Image.Image]:
-    for rel in doc.part.rels.values():
-        if rel.reltype != RT.IMAGE:
+    # Include images referenced from headers/footers too; never fetch external links.
+    relationships = (rel for part in doc.part.package.parts for rel in part.rels.values())
+    for rel in relationships:
+        if rel.reltype != RT.IMAGE or rel.is_external:
             continue
         try:
             img = Image.open(io.BytesIO(rel.target_part.blob))
@@ -24,7 +26,7 @@ def _embedded_images(doc) -> Iterator[Image.Image]:
         yield img
 
 
-def extract_docx(path: Path) -> list[str]:
+def extract_docx(path: Path, on_visual=None) -> list[str]:
     doc = Document(path)
     chunks = []
     table_number = 0
@@ -44,10 +46,12 @@ def extract_docx(path: Path) -> list[str]:
                 chunks.append(f"Table {table_number}:\n" + "\n".join(rows))
 
     seen_images: set[str] = set()
-    image_number = 0
-    for img in _embedded_images(doc):
-        text = ocr_embedded(img, seen_images)
+    for source_image_number, img in enumerate(_embedded_images(doc), 1):
+        fallback = (lambda image, info, i=source_image_number: on_visual(image, {"image": i}, info)) if on_visual else None
+        try:
+            text = ocr_embedded(img, seen_images, on_fallback=fallback)
+        finally:
+            img.close()
         if text:
-            image_number += 1
-            chunks.append(f"Image {image_number}:\n{text}")
+            chunks.append(f"Image {source_image_number}:\n{text}")
     return chunks

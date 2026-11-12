@@ -31,7 +31,7 @@ def _page_paragraphs(text: str) -> list[str]:
     return paragraphs
 
 
-def _page_image_texts(page, seen: set[str]) -> list[str]:
+def _page_image_texts(page, seen: set[str], on_visual=None, page_number: int = 1) -> list[tuple[int, str]]:
     """OCR text of each image on a page. Skips images that can't be decoded (some PDF image formats aren't
     supported by Pillow) rather than failing the whole file."""
     try:
@@ -40,20 +40,21 @@ def _page_image_texts(page, seen: set[str]) -> list[str]:
         return []
 
     texts = []
-    for image in images:
+    for image_number, image in enumerate(images, 1):
         try:
             decoded = image.image
         except Exception:
             continue
         if decoded is None:
             continue
-        text = ocr_embedded(decoded, seen)
+        fallback = (lambda img, info, i=image_number: on_visual(img, {"page": page_number, "image": i}, info)) if on_visual else None
+        text = ocr_embedded(decoded, seen, on_fallback=fallback)
         if text:
-            texts.append(text)
+            texts.append((image_number, text))
     return texts
 
 
-def extract_pdf(path: Path) -> list[str]:
+def extract_pdf(path: Path, on_visual=None) -> list[str]:
     reader = PdfReader(path)
     if reader.is_encrypted:
         if reader.decrypt("") == 0:
@@ -65,6 +66,6 @@ def extract_pdf(path: Path) -> list[str]:
         for paragraph_number, paragraph in enumerate(_page_paragraphs(text), 1):
             if paragraph:
                 chunks.append(f"Page {page_number} Paragraph {paragraph_number}\n{paragraph}")
-        for image_number, image_text in enumerate(_page_image_texts(page, seen_images), 1):
+        for image_number, image_text in _page_image_texts(page, seen_images, on_visual, page_number):
             chunks.append(f"Page {page_number} Image {image_number}\n{image_text}")
     return chunks

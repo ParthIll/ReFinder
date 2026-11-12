@@ -12,6 +12,7 @@ type Sheet = { name: string; rows: string[][]; truncated: boolean };
 type Slide = { number: number; text: string };
 export type PreviewData =
   | { kind: 'pdf' }
+  | { kind: 'image' }
   | { kind: 'docx' }
   | { kind: 'html'; key: string; slides: Slide[] }
   | { kind: 'table'; sheets: Sheet[] }
@@ -291,6 +292,7 @@ export function DocumentView({ api, path, query, passage, fallbackText, zoom }: 
   const onError = useMemo(() => (e: string) => setError(e), []);
   if (error) return <div><p className="preview-note error-note">{error}. Showing the extracted text instead.</p><TextBlocks text={fallbackText} query={query} passage={passage}/></div>;
   if (!data) return <p className="preview-note">Loading preview…</p>;
+  if (data.kind === 'image') return <img className="slide-thumb" src={`${api}/raw?path=${q}`} alt="Image preview" style={{ maxWidth: '100%', objectFit: 'contain' }}/>;
   if (data.kind === 'pdf') return <PdfView url={`${api}/raw?path=${q}`} zoom={zoom} passage={passage} onError={onError}/>;
   if (data.kind === 'docx') return <DocxView url={`${api}/raw?path=${q}`} zoom={zoom} passage={passage} onError={onError}/>;
   if (data.kind === 'html') return <HtmlView base={new URL(`${api}/quicklook/${data.key}/`, document.baseURI).href} passage={passage} onError={onError}/>;

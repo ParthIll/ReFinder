@@ -9,7 +9,8 @@ Ranking puts literal matches first: a file scores
                folder names count half; power 1 for queries of <= SHORT_QUERY_WORDS words)
   + W_PHRASE * 1 if the query (or every "quoted part") appears word for word in the file
   + W_KW     / (RRF_K + BM25 rank)       BM25 over full text, with typo'd query words mapped to close index words
-  + W_DENSE  / (RRF_K + embedding rank)  file rank = its best chunk
+  + max(W_DENSE / (RRF_K + embedding rank), W_VISUAL / (RRF_K + image rank))
+      one semantic vote per file: its best text chunk or best OCR-fallback image, in separate vector spaces
 so a filename that covers the query, or an exact phrase, outranks anything found only by meaning.
 Weights were picked on the team corpus, OrgSmith, FinanceBench and the sample corpus, with natural-language
 questions plus generated filename / filename-with-typo / exact-phrase queries.
@@ -40,10 +41,12 @@ import Stemmer
 from bm25s.stopwords import STOPWORDS_EN
 from chromadb.config import Settings
 from rapidfuzz import fuzz, process
+from refinder.vision import CACHE_ID as VISUAL_MODEL, IMAGE_BATCH, VISUAL_SUFFIXES, describe_asset
 
 if TYPE_CHECKING:
     from evaluation.query_meta import QueryMeta
     from refinder.embedder import Embedder
+    from refinder.vision import VisualEmbedder
 
 
 # ---------------------------------------------------------------- file metadata (for filters)
@@ -117,6 +120,7 @@ class Filters:
         return any(v not in (None, "", set()) for v in vars(self).values())
 
 COLLECTION_NAME = "refinder"
+VISUAL_COLLECTION_NAME = "refinder_images"
 # The desktop app passes a per-user data folder; running from the repo keeps the index in evaluation/chroma_db.
 DEFAULT_PERSIST_DIR = (Path(os.environ["REFINDER_DATA_DIR"]) / "chroma_db" if os.environ.get("REFINDER_DATA_DIR")
                        else Path(__file__).resolve().parent / "chroma_db")
@@ -133,6 +137,7 @@ W_NAME = 0.05
 W_PHRASE = 0.03
 W_KW = 1.0
 W_DENSE = 1.0
+W_VISUAL = 1.0
 # Filename share is raised to this power: a name covering the whole query keeps the full boost, one sharing a
 # couple of words with a long question (a client name, say) barely moves it.
 NAME_POW = 2
@@ -169,6 +174,17 @@ class Cancelled(Exception):
     """A newer index replaced the one being embedded."""
 
 
+class _EmptyKeywordIndex:
+    """bm25s cannot build an empty vocabulary, which is normal for a photo-only folder."""
+    vocab_dict: dict[str, int] = {}
+
+    def __init__(self, n_files: int):
+        self.n_files = n_files
+
+    def get_scores(self, tokens) -> np.ndarray:
+        return np.zeros(self.n_files, dtype=np.float32)
+
+
 class ChromaIndex:
     def __init__(self, persist_dir: Path | None = None):
         self.persist_dir = Path(persist_dir) if persist_dir else DEFAULT_PERSIST_DIR
@@ -180,16 +196,22 @@ class ChromaIndex:
         )
         self.collection = self.client.get_or_create_collection(
             name=COLLECTION_NAME, embedding_function=None, metadata={"hnsw:space": "cosine"})
+        self.visual_collection = self.client.get_or_create_collection(
+            name=VISUAL_COLLECTION_NAME, embedding_function=None,
+            metadata={"hnsw:space": "cosine", "model_name": VISUAL_MODEL})
         self.stemmer = Stemmer.Stemmer("english")
         self.lock = threading.Lock()  # guards swapping the index; searches read a consistent snapshot
-        self.generation = 0  # bumped by every build_keyword, so a stale background embed can stop
+        self.generation = 0  # bumped by each mutation, so stale background embedding stops
         self.manifest: dict[str, Any] | None = None
         self.texts: list[str] = []
-        self.bm25: bm25s.BM25 | None = None
+        self.bm25: bm25s.BM25 | _EmptyKeywordIndex | None = None
         self.keyword: dict[str, Any] = {}
         self.embedded_chunks = 0
         self.total_chunks = 0
         self.embedded_docs = 0  # files [0, embedded_docs) have all their chunks in Chroma
+        self.visual_embedded_docs = 0
+        self.embedded_images = 0
+        self.total_images = 0
 
     # ------------------------------------------------------------ state
 
@@ -199,11 +221,18 @@ class ChromaIndex:
     def count(self) -> int:
         return int(self.collection.count())
 
+    def visual_count(self) -> int:
+        return int(self.visual_collection.count())
+
     def model_name(self) -> str | None:
         return self.manifest.get("model_name") if self.manifest else None
 
     def embedding_complete(self) -> bool:
-        return bool(self.manifest and self.embedded_docs >= len(self.manifest["paths"]))
+        return bool(self.manifest and self.embedded_docs >= len(self.manifest["paths"])
+                    and self.visual_embedded_docs >= len(self.manifest["paths"]))
+
+    def pending_text(self) -> bool:
+        return any(self.texts[i].strip() for i in self.live_ids() if i >= self.embedded_docs)
 
     def roots(self) -> list[str]:
         return list(self.manifest["roots"]) if self.manifest else []
@@ -235,6 +264,8 @@ class ChromaIndex:
         self.manifest["embedding_complete"] = self.embedding_complete()
         self.manifest["embedded_docs"] = self.embedded_docs
         self.manifest["total_chunks"] = self.total_chunks
+        self.manifest["visual_embedded_docs"] = self.visual_embedded_docs
+        self.manifest["visual_model"] = VISUAL_MODEL
         self.manifest_path.write_text(json.dumps(self.manifest, ensure_ascii=False), encoding="utf-8")
 
     def load(self) -> bool:
@@ -254,10 +285,21 @@ class ChromaIndex:
         data.setdefault("whole", [False] * len(data["roots"]))
         if "stamps" not in data:  # older index: treat the files as unchanged since indexing
             data["stamps"] = [list(_stamp(p)) for p in data["paths"]]
+        if "visuals" not in data:
+            data["visuals"] = [[] for _ in data["paths"]]
+            # Startup reconciliation re-extracts eligible files once to collect OCR fallback assets.
+            for i, path in enumerate(data["paths"]):
+                if Path(path).suffix.lower() in VISUAL_SUFFIXES:
+                    data["stamps"][i] = [-1.0, -1]
+        if data.get("visual_model", VISUAL_MODEL) != VISUAL_MODEL:
+            self._reset_visual_collection()
+            data["visual_embedded_docs"] = 0
         self._set_keyword(data)
         self.embedded_docs = int(data.get("embedded_docs", 0))
         self.embedded_chunks = self.count()
         self.total_chunks = data.get("total_chunks", self.embedded_chunks)
+        self.visual_embedded_docs = int(data.get("visual_embedded_docs", 0))
+        self.embedded_images = self.visual_count()
         return True
 
     # ------------------------------------------------------------ indexing
@@ -271,9 +313,12 @@ class ChromaIndex:
         alive = np.ones(n, dtype=bool)
         alive[manifest.get("deleted", [])] = False
         texts = ["\n\n".join(ps) for ps in manifest["pieces"]]  # deleted files keep an empty slot
-        tokenized = self._tokenize(texts)
-        bm25 = bm25s.BM25()
-        bm25.index(tokenized, show_progress=False)
+        tokenized = self._tokenize(texts or [""])
+        if any(tokenized.ids):
+            bm25 = bm25s.BM25()
+            bm25.index(tokenized, show_progress=False)
+        else:
+            bm25 = _EmptyKeywordIndex(n)
         roots = manifest["roots"]
         # Folder words come from the path below the indexed folder, so e.g. "Users" never counts as a match.
         names = [_name_words(os.path.relpath(p, roots[r])) if alive[i] else ([], [])
@@ -300,9 +345,17 @@ class ChromaIndex:
         keyword["path_id"] = {manifest["paths"][i]: i for i in np.flatnonzero(alive).tolist()}
         with self.lock:
             self.manifest, self.texts, self.bm25, self.keyword = manifest, texts, bm25, keyword
+            self.total_images = sum(len(v) for v in manifest.get("visuals", []))
+
+    def _reset_visual_collection(self) -> None:
+        self.client.delete_collection(VISUAL_COLLECTION_NAME)
+        self.visual_collection = self.client.get_or_create_collection(
+            name=VISUAL_COLLECTION_NAME, embedding_function=None,
+            metadata={"hnsw:space": "cosine", "model_name": VISUAL_MODEL})
+        self.visual_embedded_docs = self.embedded_images = self.total_images = 0
 
     def replace(self, root: Path, paths: list[str], pieces: list[list[str]], model_name: str,
-                whole: bool = False) -> int:
+                whole: bool = False, visuals: list[list[dict]] | None = None) -> int:
         """Stage 1: replace the whole index with a keyword-only one over these files (absolute paths) from one
         folder. Returns the new generation."""
         with self.lock:
@@ -316,13 +369,16 @@ class ChromaIndex:
                 name=COLLECTION_NAME, embedding_function=None,
                 metadata={"hnsw:space": "cosine", "model_name": model_name})
             self.embedded_chunks = self.total_chunks = self.embedded_docs = 0
+            self._reset_visual_collection()
         self._set_keyword({"roots": [str(root)], "whole": [whole], "root_of": [0] * len(paths),
                            "model_name": model_name, "paths": paths, "pieces": pieces,
-                           "stamps": [list(_stamp(p)) for p in paths], "deleted": []})
+                           "stamps": [list(_stamp(p)) for p in paths], "deleted": [],
+                           "visuals": visuals if visuals is not None else [[] for _ in paths]})
         self._write_manifest()
         return generation
 
-    def add(self, root: Path, paths: list[str], pieces: list[list[str]], whole: bool = False) -> int:
+    def add(self, root: Path, paths: list[str], pieces: list[list[str]], whole: bool = False,
+            visuals: list[list[dict]] | None = None) -> int:
         """Stage 1 for an extra folder: append these files (absolute paths, none already indexed) and rebuild the
         keyword index over everything. Existing files keep their ids and vectors; `embed` then only embeds the new
         files. A folder containing already-indexed folders absorbs them. Returns the new generation."""
@@ -342,7 +398,8 @@ class ChromaIndex:
             roots, whole_flags = list(old["roots"]), list(old_whole)
             root_of = list(old["root_of"]) + [parent] * len(paths)
         manifest = {**old, "roots": roots, "whole": whole_flags, "root_of": root_of, "paths": old["paths"] + paths,
-                    "pieces": old["pieces"] + pieces, "stamps": old["stamps"] + [list(_stamp(p)) for p in paths]}
+                    "pieces": old["pieces"] + pieces, "stamps": old["stamps"] + [list(_stamp(p)) for p in paths],
+                    "visuals": old["visuals"] + (visuals if visuals is not None else [[] for _ in paths])}
         with self.lock:
             self.generation += 1  # a running embed stops; the next one resumes from embedded_docs
             generation = self.generation
@@ -350,7 +407,8 @@ class ChromaIndex:
         self._write_manifest()
         return generation
 
-    def apply_changes(self, added: list[tuple[int, str, list[str]]], removed: list[int]) -> int:
+    def apply_changes(self, added: list[tuple[int, str, list[str]]], removed: list[int],
+                      visuals: list[list[dict]] | None = None) -> int:
         """Incremental update: mark `removed` ids deleted (their vectors go) and append `added` files as
         (root index, absolute path, pieces). A changed file is removed and added again under a new id, so only it
         is re-embedded. Rebuilds the keyword index over everything; returns the new generation."""
@@ -362,14 +420,19 @@ class ChromaIndex:
             if removed:
                 self.collection.delete(where={"doc_id": {"$in": removed}})
                 self.embedded_chunks = self.count()
+                self.visual_collection.delete(where={"doc_id": {"$in": removed}})
+                self.embedded_images = self.visual_count()
         pieces = list(old["pieces"])
+        assets = list(old["visuals"])
         for i in removed:
             pieces[i] = []  # drop the text; the id stays so later ids and vectors don't move
+            assets[i] = []
         manifest = {**old, "pieces": pieces + [p for _, _, p in added],
                     "paths": old["paths"] + [p for _, p, _ in added],
                     "root_of": old["root_of"] + [r for r, _, _ in added],
                     "stamps": old["stamps"] + [list(_stamp(p)) for _, p, _ in added],
-                    "deleted": sorted(set(old.get("deleted", [])) | set(removed))}
+                    "deleted": sorted(set(old.get("deleted", [])) | set(removed)),
+                    "visuals": assets + (visuals if visuals is not None else [[] for _ in added])}
         self._set_keyword(manifest)
         self._write_manifest()
         return generation
@@ -406,9 +469,10 @@ class ChromaIndex:
                 name=COLLECTION_NAME, embedding_function=None, metadata={"hnsw:space": "cosine"})
             self.manifest, self.texts, self.bm25, self.keyword = None, [], None, {}
             self.embedded_chunks = self.total_chunks = self.embedded_docs = 0
+            self._reset_visual_collection()
         self.manifest_path.unlink(missing_ok=True)
 
-    def embed(self, embedder: "Embedder", generation: int, model_lock: threading.Lock,
+    def embed(self, embedder: "Embedder | None", generation: int, model_lock: threading.Lock,
               on_progress: Callable[[int, int], None] | None = None) -> None:
         """Stage 2: embed capped paragraph chunks of files not embedded yet (ids >= embedded_docs) into Chroma.
         Raises Cancelled if the index changed meanwhile. `model_lock` serializes model use with query encoding."""
@@ -416,11 +480,18 @@ class ChromaIndex:
 
         first = self.embedded_docs
         with self.lock:  # drop chunks of a file that was half done when a previous embed stopped
+            if generation != self.generation:
+                raise Cancelled
             self.collection.delete(where={"doc_id": {"$gte": first}})
             done_chunks = self.count()
         pieces = self.manifest["pieces"][first:]
         texts = self.texts[first:]
-        chunk_texts, owner, _ = chunk_corpus(embedder, texts, pieces, "paragraph", max_chunks=MAX_CHUNKS_PER_FILE)
+        if embedder is None:
+            if any(t.strip() for t in texts):
+                raise ValueError("A text embedder is required for nonempty text")
+            chunk_texts, owner = [], np.empty(0, dtype=int)
+        else:
+            chunk_texts, owner, _ = chunk_corpus(embedder, texts, pieces, "paragraph", max_chunks=MAX_CHUNKS_PER_FILE)
         owner = np.asarray(owner, dtype=int) + first
         ordinal = np.zeros(len(owner), dtype=int)  # chunk position within its file (after capping)
         for i in range(1, len(owner)):
@@ -454,6 +525,48 @@ class ChromaIndex:
             if generation != self.generation:
                 raise Cancelled
             self.embedded_docs = n_docs
+            self._write_manifest()
+
+    def embed_visuals(self, get_embedder: Callable[[], "VisualEmbedder"], generation: int,
+                      model_lock: threading.Lock) -> None:
+        """Resume OCR-fallback image indexing. Checkpoint whole files; retries replace partial files."""
+        with self.lock:
+            if generation != self.generation:
+                raise Cancelled
+            first, manifest = self.visual_embedded_docs, self.manifest
+            self.visual_collection.delete(where={"doc_id": {"$gte": first}})
+            self.embedded_images = self.visual_count()
+        encoder = None
+        for doc_id in range(first, len(manifest["paths"])):
+            if generation != self.generation:
+                raise Cancelled
+            assets = manifest["visuals"][doc_id]
+            if assets and encoder is None:
+                encoder = get_embedder()
+            for start in range(0, len(assets), IMAGE_BATCH):
+                if generation != self.generation:
+                    raise Cancelled
+                batch = assets[start:start+IMAGE_BATCH]
+                with model_lock:
+                    vectors = encoder.encode_assets(batch)
+                with self.lock:
+                    if generation != self.generation:
+                        raise Cancelled
+                    self.visual_collection.upsert(
+                        ids=[f"{doc_id}:{start+i}" for i in range(len(batch))], embeddings=vectors,
+                        documents=[describe_asset(a) for a in batch],
+                        metadatas=[{**a, "path": manifest["paths"][doc_id], "doc_id": doc_id,
+                                    "image_index": start+i} for i, a in enumerate(batch)])
+                    self.embedded_images = self.visual_count()
+            with self.lock:
+                if generation != self.generation:
+                    raise Cancelled
+                self.visual_embedded_docs = doc_id+1
+                if assets:
+                    self._write_manifest()
+        with self.lock:
+            if generation != self.generation:
+                raise Cancelled
             self._write_manifest()
 
     def file_text(self, path: str) -> str | None:
@@ -570,7 +683,28 @@ class ChromaIndex:
                 best.append((int(meta["doc_id"]), doc or "", int(meta["chunk_index"])))
         return best
 
-    def signals(self, query: str, query_vec: np.ndarray | None, allowed: np.ndarray | None = None) -> dict[str, Any]:
+    def _visual_ranking(self, query_vec: np.ndarray | None,
+                        allowed: np.ndarray | None = None) -> list[tuple[int, dict]]:
+        if query_vec is None or not self.visual_count():
+            return []
+        alive = self.keyword["alive"]
+        ids = np.flatnonzero(alive if allowed is None else allowed & alive).tolist()
+        if not ids:
+            return []
+        raw = self.visual_collection.query(
+            query_embeddings=[np.asarray(query_vec, dtype=np.float32)],
+            n_results=min(self.visual_count(), DENSE_CANDIDATES), where={"doc_id": {"$in": ids}},
+            include=["metadatas"])
+        best, seen = [], set()
+        for metadata in raw["metadatas"][0]:
+            if metadata and metadata["doc_id"] not in seen:
+                doc_id = int(metadata["doc_id"])
+                seen.add(doc_id)
+                best.append((doc_id, metadata))
+        return best
+
+    def signals(self, query: str, query_vec: np.ndarray | None, allowed: np.ndarray | None = None,
+                visual_vec: np.ndarray | None = None) -> dict[str, Any]:
         """Everything ranking needs for one query (split out so evaluation can try other weights)."""
         words = [w for w in _words(query) if w not in _STOP]
         keyword, tokens = self._keyword_ranking(query)
@@ -581,20 +715,24 @@ class ChromaIndex:
             "name": self._name_scores(words),
             "phrase": self._phrase_hits(query, keyword[:PHRASE_CANDIDATES]),
             "dense": self._dense_ranking(query_vec, allowed),
+            "visual": self._visual_ranking(visual_vec, allowed),
         }
 
     @staticmethod
     def fuse(sig: dict[str, Any], n_files: int, w_name=W_NAME, w_phrase=W_PHRASE, w_kw=W_KW,
-             w_dense=W_DENSE, name_pow=NAME_POW) -> np.ndarray:
+             w_dense=W_DENSE, name_pow=NAME_POW, w_visual=W_VISUAL) -> np.ndarray:
         pw = 1 if sig["n_words"] <= SHORT_QUERY_WORDS else name_pow
         score = w_name * sig["name"] ** pw
         for f in sig["phrase"]:
             score[f] += w_phrase
         for rank, f in enumerate(sig["keyword"], 1):
             score[f] += w_kw / (RRF_K + rank)
+        semantic = np.zeros(n_files)
         for rank, (f, _, _) in enumerate(sig["dense"], 1):
-            score[f] += w_dense / (RRF_K + rank)
-        return score
+            semantic[f] = w_dense / (RRF_K + rank)
+        for rank, (f, _) in enumerate(sig.get("visual", []), 1):
+            semantic[f] = max(semantic[f], w_visual / (RRF_K + rank))
+        return score + semantic
 
     def _keyword_snippet(self, doc_id: int, tokens: list[str], phrase: str | None) -> str:
         """The paragraph holding the exact phrase, else the one sharing the most (stemmed) query words."""
@@ -709,6 +847,7 @@ class ChromaIndex:
         allowed[f] = False
         score = np.zeros(len(allowed))
         dense_hit: dict[int, tuple[str, int]] = {}
+        visual_hit: dict[int, dict] = {}
         got = self.collection.get(where={"doc_id": f}, include=["embeddings"])
         embs = got.get("embeddings")
         if embs is not None and len(embs):
@@ -718,6 +857,14 @@ class ChromaIndex:
                     (d for d in self._dense_ranking(v, allowed if mask is not None else None) if d[0] != f), 1):
                 score[g] += 1.0 / (RRF_K + rank)
                 dense_hit[g] = (text, ci)
+        visual = self.visual_collection.get(where={"doc_id": f}, include=["embeddings"])
+        image_vectors = visual.get("embeddings")
+        if image_vectors is not None and len(image_vectors):
+            v = np.asarray(image_vectors, dtype=np.float32).mean(axis=0)
+            v /= np.linalg.norm(v) or 1.0
+            for rank, (g, asset) in enumerate(self._visual_ranking(v, allowed), 1):
+                score[g] = max(score[g], W_VISUAL / (RRF_K + rank))
+                visual_hit[g] = asset
         # Keyword side: the file's words that are frequent in it but rare elsewhere.
         stems = self._tokenize([self.texts[f]], ids=False)[0]
         counts = Counter(t for t in stems if t in self.bm25.vocab_dict and len(t) > 2)
@@ -739,19 +886,25 @@ class ChromaIndex:
         out = []
         for g in top:
             text, ci = dense_hit.get(g) or (self._keyword_snippet(g, terms, None), None)
+            visual_match = None
+            if not text and g in visual_hit:
+                text, ci = describe_asset(visual_hit[g]), None
+                visual_match = {key: int(visual_hit[g][key]) for key in ("page", "image") if key in visual_hit[g]}
             text = " ".join(text.split())
             out.append({"path": self.manifest["paths"][g], "score": float(score[g]) / best,
-                        "snippet": text[:SNIPPET_CHARS], "passage": text[:PASSAGE_CHARS], "chunk_id": ci,
+                        "snippet": text[:SNIPPET_CHARS], "passage": "" if visual_match is not None else text[:PASSAGE_CHARS], "chunk_id": ci,
+                        "visual_match": visual_match,
                         **self._result_meta(g)})
         return out
 
     def search(self, query: str, query_vec: np.ndarray | None, k: int = 5,
-               filters: Filters | None = None, meta: "QueryMeta | None" = None) -> list[dict[str, Any]]:
+               filters: Filters | None = None, meta: "QueryMeta | None" = None,
+               visual_vec: np.ndarray | None = None) -> list[dict[str, Any]]:
         """Top-k files. Score is scaled to 0-1, where 1 means a literal match plus top ranks from both searches."""
         if not self.ready():
             return []
         mask = self.filter_mask(filters)
-        sig = self.signals(query, query_vec, mask)
+        sig = self.signals(query, query_vec, mask, visual_vec=visual_vec)
         score = self.fuse(sig, len(self.manifest["paths"]))
         score[~(self.keyword["alive"] if mask is None else mask)] = 0
         if meta is not None and meta.active():
@@ -768,9 +921,13 @@ class ChromaIndex:
                 score[close] += W_RECENT * np.exp(-age_days[close] / RECENT_DAYS)
         top = [int(f) for f in np.argsort(-score, kind="stable")[:k] if score[f] > 0]
         best_possible = W_NAME + (W_KW + W_DENSE) / (RRF_K + 1)
+        if sig["visual"]:
+            best_possible += (max(W_DENSE, W_VISUAL) - W_DENSE) / (RRF_K + 1)
         if meta is not None and meta.active():
             best_possible += W_META_TYPE * bool(meta.types) + W_META_DATE * (meta.after is not None or meta.before is not None)
         dense_hit = {f: (text, ci) for f, text, ci in sig["dense"]}
+        dense_rank = {f: rank for rank, (f, _, _) in enumerate(sig["dense"], 1)}
+        visual_hit = {f: (rank, asset) for rank, (f, asset) in enumerate(sig["visual"], 1)}
         phrase = " ".join(_words(query))
         results = []
         for f in top:
@@ -778,12 +935,18 @@ class ChromaIndex:
             literal = f in sig["phrase"] or f not in dense_hit
             text, chunk_index = ((self._keyword_snippet(f, sig["tokens"], phrase if f in sig["phrase"] else None), None)
                                  if literal else dense_hit[f])
+            visual_match = None
+            if f in visual_hit and f not in sig["phrase"] and visual_hit[f][0] <= dense_rank.get(f, float("inf")):
+                asset = visual_hit[f][1]
+                text, chunk_index = describe_asset(asset), None
+                visual_match = {key: int(asset[key]) for key in ("page", "image") if key in asset}
             results.append({
                 "path": self.manifest["paths"][f],
                 "score": min(1.0, float(score[f]) / best_possible),
                 "snippet": " ".join(text.split())[:SNIPPET_CHARS],
-                "passage": " ".join(text.split())[:PASSAGE_CHARS],
+                "passage": "" if visual_match is not None else " ".join(text.split())[:PASSAGE_CHARS],
                 "chunk_id": chunk_index,
+                "visual_match": visual_match,
                 **self._result_meta(f),
             })
         return results

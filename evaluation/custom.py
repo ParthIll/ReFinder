@@ -71,10 +71,15 @@ EXTRACT_CACHE = CACHE_DIR.parent / "extract"
 def extract_cached(p: Path, use_cache: bool) -> list[Piece]:
     """extract_pieces with a per-file disk cache keyed by path, size and mtime (some PDFs take minutes to parse)."""
     st = p.stat()
-    key = hashlib.sha256(f"{p.resolve()}|{st.st_size}|{st.st_mtime_ns}".encode()).hexdigest()[:24]
+    from refinder.vision import asset_path, cache_dir
+    from refinder.extract import visual_assets
+
+    key = hashlib.sha256(f"visual-v1|{cache_dir().resolve()}|{p.resolve()}|{st.st_size}|{st.st_mtime_ns}".encode()).hexdigest()[:24]
     cache = EXTRACT_CACHE / f"{key}.pkl"
     if use_cache and cache.exists():
-        return pickle.loads(cache.read_bytes())
+        cached = pickle.loads(cache.read_bytes())
+        if all(asset_path(a).is_file() for a in visual_assets(cached)):
+            return cached
     file_pieces = extract_pieces(p)
     EXTRACT_CACHE.mkdir(parents=True, exist_ok=True)
     cache.write_bytes(pickle.dumps(file_pieces))

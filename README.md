@@ -14,6 +14,53 @@ pip install -r requirements.txt
 python main.py "recipe for dinner"   # first run downloads all-MiniLM-L6-v2 (~90MB), then runs offline
 ```
 
+### Image search and OCR fallback
+
+The API also indexes visual content with **MobileCLIP2-S0** (the S0 model used in
+the vision benchmark). Start the backend with:
+
+```bash
+uvicorn evaluation.server:app --host 127.0.0.1 --port 8000
+```
+
+For PDF and DOCX files, embedded raster images are extracted first, without the
+surrounding document margins. DOCX headers and footers are included. Repeated images
+inside a file are OCR'd once, and small decorative images are skipped by the existing
+OCR reader. Standalone PNG/JPEG/GIF/BMP/WebP/TIFF images are supported too.
+
+- Successful OCR text follows the existing keyword and text-embedding pipeline.
+- Empty OCR, mean recognized-word confidence below the existing threshold of 60,
+  or a missing/failing Tesseract engine also queues the image for visual embedding.
+  Any usable OCR words are retained. This threshold is a routing heuristic, not a
+  calibrated probability that the image is searchable.
+- MobileCLIP's matching text encoder embeds visual queries. Its 512-dimensional
+  image vectors live in a separate `refinder_images` Chroma collection; smart search
+  fuses its document ranking with the existing keyword/text rankings. Keyword mode
+  stays text-only. Multiple matching images give a document one visual rank, and
+  each file gets its stronger text-or-image semantic vote rather than a bonus
+  simply for having both kinds of content.
+- Results point to the original file, with an `Image N, page M` snippet and
+  `visual_match` location metadata. They do not invent captions or OCR text.
+
+The model loads only when fallback images exist. The first use downloads roughly
+300 MB of weights; later indexing/search works offline. Source runs cache assets,
+vectors and weights under `.cache/visual/`; the packaged app uses
+`$REFINDER_DATA_DIR/visual/`. Content hashes reuse image embeddings across documents
+and restarts. Folder additions/removals and file changes update both vector stores.
+Older indexes re-extract eligible files once during startup reconciliation.
+
+For OCR, install the Tesseract executable separately (`brew install tesseract` on
+macOS). Without it, embedded/standalone images use visual fallback while native
+PDF/DOCX text is still extracted. Extractable raster images are supported; this does
+not render vector-only PDF pages or decode unsupported DOCX graphics such as EMF/SVG.
+Visual embeddings retrieve appearance and do not replace reading small text/numbers.
+
+Run the deterministic integration checks with:
+
+```bash
+python -m unittest discover -s tests -v
+```
+
 ## Evaluation
 Benchmarks embedding models against a BM25 keyword baseline on the Kaggle
 [Corpus for Semantic Matching](https://www.kaggle.com/datasets/mantunes/corpus-for-semantic-matching)

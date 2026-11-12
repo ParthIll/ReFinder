@@ -15,9 +15,10 @@ pyinstaller packaging/refinder_backend.py \
   --add-data "$PWD/refinder-extractors:refinder-extractors" \
   --hidden-import evaluation.server --hidden-import evaluation.database --hidden-import evaluation.preview \
   --hidden-import evaluation.watcher --hidden-import evaluation.query_meta --hidden-import evaluation.custom --hidden-import evaluation.common \
-  --hidden-import refinder.embedder --hidden-import refinder.extract \
-  --hidden-import pypdf --hidden-import docx --hidden-import pptx --hidden-import openpyxl \
+  --hidden-import refinder.embedder --hidden-import refinder.extract --hidden-import refinder.vision \
+  --hidden-import pypdf --hidden-import docx --hidden-import pptx --hidden-import openpyxl --hidden-import pytesseract \
   --collect-all chromadb --collect-all sentence_transformers --collect-submodules uvicorn \
+  --collect-all open_clip --collect-all timm \
   --collect-data bm25s --collect-binaries Stemmer --collect-submodules watchdog \
   --exclude-module matplotlib --exclude-module tkinter --exclude-module IPython --exclude-module jupyter
 echo "Built $OUT/refinder-backend ($(du -sh "$OUT/refinder-backend" | cut -f1))"

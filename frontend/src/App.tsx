@@ -39,7 +39,7 @@ function filterParams(f: Filters): string {
 }
 const formatDate = (t: number) => t ? new Date(t * 1000).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' }) : '—';
 const formatSize = (b: number) => b < 1e3 ? `${b} B` : b < 1e6 ? `${(b / 1e3).toFixed(0)} KB` : b < 1e9 ? `${(b / 1e6).toFixed(1)} MB` : `${(b / 1e9).toFixed(2)} GB`;
-type Status = { indexed_files: number; chunks: number; state: string; embedded_chunks: number; total_chunks: number; error: string | null; folder: string | null; folders: string[]; whole_computer: boolean; file_types: Record<string, number> };
+type Status = { indexed_files: number; chunks: number; state: string; embedded_chunks: number; total_chunks: number; embedded_images?: number; total_images?: number; error: string | null; folder: string | null; folders: string[]; whole_computer: boolean; file_types: Record<string, number> };
 type Theme = 'system' | 'light' | 'dark';
 type Mode = 'smart' | 'keyword';
 const API = import.meta.env.DEV ? '/api' : 'http://127.0.0.1:8000';
@@ -135,19 +135,21 @@ function App() {
   // Files are keyword-searchable as soon as /index returns; meaning-based results fill in while embedding runs.
   const indexing = status?.state === 'extracting' || status?.state === 'embedding' || status?.state === 'updating';
   // "Understanding" = embedding chunks for meaning search. Track the rate between polls for a time-left estimate.
-  const embedding = status?.state === 'embedding' && (status.total_chunks || 0) > 0;
-  const embedPct = embedding ? Math.min(100, (100 * status!.embedded_chunks) / status!.total_chunks) : 0;
+  const embedTotal = (status?.total_chunks || 0) + (status?.total_images || 0);
+  const embedDone = (status?.embedded_chunks || 0) + (status?.embedded_images || 0);
+  const embedding = status?.state === 'embedding' && embedTotal > 0;
+  const embedPct = embedding ? Math.min(100, (100 * embedDone) / embedTotal) : 0;
   const embedStart = useRef<{ t: number; done: number; total: number } | null>(null);
   const [etaSeconds, setEtaSeconds] = useState<number | null>(null);
   useEffect(() => {
     if (!embedding || !status) { embedStart.current = null; setEtaSeconds(null); return; }
     const now = Date.now() / 1000, start = embedStart.current;
-    if (!start || start.total !== status.total_chunks || status.embedded_chunks < start.done) {
-      embedStart.current = { t: now, done: status.embedded_chunks, total: status.total_chunks }; setEtaSeconds(null); return;
+    if (!start || start.total !== embedTotal || embedDone < start.done) {
+      embedStart.current = { t: now, done: embedDone, total: embedTotal }; setEtaSeconds(null); return;
     }
-    const rate = (status.embedded_chunks - start.done) / Math.max(1, now - start.t);
-    setEtaSeconds(rate > 0 && now - start.t >= 3 ? (status.total_chunks - status.embedded_chunks) / rate : null);
-  }, [embedding, status]);
+    const rate = (embedDone - start.done) / Math.max(1, now - start.t);
+    setEtaSeconds(rate > 0 && now - start.t >= 3 ? (embedTotal - embedDone) / rate : null);
+  }, [embedding, status, embedDone, embedTotal]);
   const etaText = etaSeconds === null ? '' : etaSeconds < 60 ? 'less than a minute left' : `about ${Math.round(etaSeconds / 60)} min left`;
   useEffect(() => { if (!indexing) return; const t = setInterval(() => void refreshStatus(), 1000); return () => clearInterval(t); }, [indexing]);
   useEffect(() => {
@@ -264,7 +266,7 @@ function App() {
     if (!window.confirm('Add every supported document in your home folder? Apps, system, hidden and code-dependency folders are skipped. Files already indexed are not read again. This can take several minutes.')) return;
     await startIndex({ whole_computer: true, mode: 'add' }, '');
   }
-  const statusText = busy && !indexing ? 'Working…' : !status ? (starting ? 'Starting search engine…' : 'Backend unavailable') : status.state === 'extracting' ? 'Reading files…' : status.state === 'updating' ? 'Updating changed files…' : status.state === 'embedding' ? `${status.indexed_files.toLocaleString()} files · understanding ${status.total_chunks ? Math.floor(100 * status.embedded_chunks / status.total_chunks) : 0}%` : status.state === 'error' ? (status.error || 'Indexing error') : status.indexed_files ? `${status.indexed_files.toLocaleString()} files indexed` : 'No folder indexed';
+  const statusText = busy && !indexing ? 'Working…' : !status ? (starting ? 'Starting search engine…' : 'Backend unavailable') : status.state === 'extracting' ? 'Reading files…' : status.state === 'updating' ? 'Updating changed files…' : status.state === 'embedding' ? `${status.indexed_files.toLocaleString()} files · understanding ${status.total_chunks ? Math.floor(embedPct) : 0}%` : status.state === 'error' ? (status.error || 'Indexing error') : status.indexed_files ? `${status.indexed_files.toLocaleString()} files indexed` : 'No folder indexed';
   const selectResult = (result: Result) => { setSelected(result); if (window.innerWidth < 820) setPreviewOpen(true); };
   async function openFile(path: string, reveal = false, app?: string) {
     try { await request('/open', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path, reveal, app }) }); }
@@ -326,7 +328,7 @@ function App() {
   return <div className={`app ${collapsed ? 'sidebar-collapsed' : ''}`}>
     <aside className="sidebar"><div className="sidebar-head"><span className="brand">ReFinder</span><button className="icon-button collapse-button" title={collapsed ? 'Expand sidebar' : 'Collapse sidebar'} aria-label={collapsed ? 'Expand sidebar' : 'Collapse sidebar'} onClick={() => setCollapsed(!collapsed)}><Icon name="sidebar"/></button></div>
       <div className="sidebar-scroll"><p className="section-label">LIBRARY</p><button className={`nav-item ${mode === 'smart' ? 'active' : ''}`} title="Search" onClick={() => switchMode('smart')}><Icon name="search"/><span>Search</span></button><button className={`nav-item ${mode === 'keyword' ? 'active' : ''}`} title="Keyword search" onClick={() => switchMode('keyword')}><Icon name="keyword"/><span>Keyword search</span></button><p className="section-label folder-label">FOLDER</p>{folders.map(f => <div key={f} className="nav-item folder-item" title={f}><Icon name={isHome(f) ? 'computer' : 'folder'}/><span>{isHome(f) ? 'Whole computer' : filename(f)}</span><button className="folder-remove" onClick={() => void removeFolder(f)} disabled={busy} aria-label={`Stop searching ${filename(f)}`} title="Remove from search"><Icon name="close"/></button></div>)}<button className="nav-item" title="Add a folder to search" onClick={() => chooseFolder(folders.length ? 'add' : 'replace')} disabled={busy}><Icon name="plus"/><span>{folders.length ? 'Add folder' : 'Choose folder'}</span></button>{folders.length > 0 && <button className="nav-item" title="Search a different folder instead" onClick={() => chooseFolder('replace')} disabled={busy}><Icon name="swap"/><span>Replace all</span></button>}<button className="nav-item" title="Index whole computer" onClick={indexWholeComputer} disabled={busy}><Icon name="computer"/><span>Index whole computer</span></button></div>
-      <div className="sidebar-bottom">{embedding && <div className="embed-progress" title={`${status!.embedded_chunks.toLocaleString()} of ${status!.total_chunks.toLocaleString()} passages understood`}>
+      <div className="sidebar-bottom">{embedding && <div className="embed-progress" title={`${embedDone.toLocaleString()} of ${embedTotal.toLocaleString()} passages and images understood`}>
         <div className="embed-progress-label"><span>Understanding files</span><span>{Math.floor(embedPct)}%</span></div>
         <div className="progress-track" role="progressbar" aria-label="Understanding files" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.floor(embedPct)}><div className="progress-fill" style={{ width: `${embedPct}%` }}/></div>
         <div className="embed-progress-sub">{etaText || 'Keyword search works now; results get smarter as this finishes.'}</div>
