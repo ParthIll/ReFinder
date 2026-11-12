@@ -64,7 +64,16 @@ persistence, API; Frontend owns setup/search/preview UX.
   PPTX as Quick Look HTML (macOS, `/quicklook/{key}/`), and highlights each result's `passage` by word overlap
   (`highlight.ts`). Matches `custom.py --models
   BAAI/bge-small-en-v1.5 --fp16 --max-chunks 20 --hybrid`; team corpus via the API: Hit@1 0.414 / Hit@5 0.755,
-  searchable in ~15 s, fully embedded in ~75 s. No folder removal, SQLite ledger or rescan of changed files yet.
+  searchable in ~15 s, fully embedded in ~75 s.
+  Keeping current: `evaluation/watcher.py` (watchdog) reports changed paths; `server.reconcile` re-reads new/changed
+  files and drops deleted ones (a startup pass catches changes made while closed). Deleted or replaced files are
+  tombstoned (`manifest["deleted"]`, empty pieces, vectors removed) so doc ids never shift; `stamps` hold
+  (mtime, size) per file. `/folders/remove` drops one folder. Smart search reads type/date/recency hints from the
+  query (`evaluation/query_meta.py`) as small boosts (team 0.516->0.520 Hit@1, sample 0.870->0.878); `/similar` is
+  "More like this" (mean chunk vector + distinctive-word BM25).
+- Desktop launcher: `frontend/src-tauri/src/backend.rs` starts the backend with the app and stops it on quit (reuses
+  one already on :8000; dev runs `.venv` uvicorn; packaged builds run the PyInstaller backend from
+  `packaging/build_backend.sh`, index in the app data dir). `npm run build:app` builds both (~1.5 GB .app).
 - `evaluation/custom.py` — main benchmark: corpus folder + query CSV(s); auto-discovers the team's per-folder
   query CSVs (source_file/corpus_path, secondary_relevant_files, query_type, split). Dense vs BM25, Hit@1/5/10,
   Recall@10, MRR@10, graded nDCG@10, breakdowns by folder/category/file type, latency, `--chunking`, `--tree-*`.

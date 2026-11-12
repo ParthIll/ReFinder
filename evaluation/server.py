@@ -5,23 +5,30 @@ embeds a capped sample of paragraph chunks per file with bge-small into Chroma. 
 rankings (see evaluation/database.py), so results improve while embedding runs.
 """
 
+import logging
 import os
 import re
+import sys
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse as RawFileResponse
 from pydantic import BaseModel
 
-from evaluation.database import Cancelled, ChromaIndex, Filters
+from evaluation.database import Cancelled, ChromaIndex, Filters, _stamp
+from evaluation.watcher import FolderWatcher
 
 # Fastest model at good accuracy in the benchmark; fp16 is ~1.3x faster on GPU/MPS with the same results.
 MODEL_NAME = "BAAI/bge-small-en-v1.5"
 # Process start-up costs a few seconds, so small folders extract in-process.
 PARALLEL_MIN_FILES = 200
+# The packaged app keeps no extraction cache next to its (read-only) code; the manifest already stores the text.
+USE_EXTRACT_CACHE = not getattr(sys, "frozen", False) and os.environ.get("REFINDER_EXTRACT_CACHE", "1") != "0"
+log = logging.getLogger("refinder")
 
 
 # ---------------------------------------------------------
@@ -65,6 +72,8 @@ class SearchResponse(BaseModel):
     results: list[SearchResult]
     # Keyword mode only: the query with misspelled words corrected, e.g. "paystbu" -> "paystub".
     suggestion: str | None = None
+    # Hints read from the query and used for ranking, e.g. ["PDF", "from 2025"].
+    understood: list[str] = []
 
 
 class StatusResponse(BaseModel):
@@ -86,6 +95,10 @@ class StatusResponse(BaseModel):
 class FileResponse(BaseModel):
     path: str
     text: str
+
+
+class RemoveFolderRequest(BaseModel):
+    folder: str
 
 
 class OpenRequest(BaseModel):
@@ -149,13 +162,140 @@ def _start_embedding() -> None:
     threading.Thread(target=_embed_in_background, args=(store.generation,), daemon=True).start()
 
 
+def _extract(paths_by_root: dict[int, list[Path]]) -> list[tuple[int, str, list[str]]]:
+    """(root index, absolute path, piece texts) for each file that extracts; failures are left out."""
+    from evaluation.custom import load_corpus
+
+    out = []
+    roots = store.roots()
+    for r, files in paths_by_root.items():
+        root = Path(roots[r])
+        workers = min(8, os.cpu_count() or 1) if len(files) >= PARALLEL_MIN_FILES else 1
+        rel, _, pieces, _ = load_corpus(root, workers=workers, files=files, use_cache=USE_EXTRACT_CACHE)
+        out += [(r, str(root / p), [x.text for x in ps]) for p, ps in zip(rel, pieces)]
+    return out
+
+
+def reconcile(files: set[str], folders: set[str]) -> bool:
+    """Bring the index in line with the disk for these changed files and folders (a folder means everything under
+    it): new files are read and embedded, changed files re-read, deleted or moved-away files dropped. Returns False
+    if another indexing job is running, so the caller retries."""
+    global index_state, index_error
+    from evaluation.custom import list_files, wanted_file
+
+    if not store.ready():
+        return True
+    if not index_lock.acquire(blocking=False):
+        return False
+    try:
+        roots, whole = store.roots(), store.whole_roots()
+        inside = lambda child, parent: child == parent or child.startswith(parent.rstrip(os.sep) + os.sep)
+
+        def root_index(path: str) -> int | None:  # the innermost indexed folder holding this path
+            matches = [i for i, r in enumerate(roots) if inside(path, r)]
+            return max(matches, key=lambda i: len(roots[i])) if matches else None
+
+        current: dict[str, int] = {}  # files that should be indexed, within the changed scope
+        scope: set[int] = set()  # indexed files within the changed scope
+        for folder in folders:
+            # A changed folder may sit inside an indexed folder or (e.g. deleted parent) contain whole ones.
+            targets = [folder] if root_index(folder) is not None else [r for r in roots if inside(r, folder)]
+            for target in targets:
+                r = root_index(target)
+                if Path(target).is_dir():
+                    for f in list_files(Path(target), whole_computer=whole[r]):
+                        if wanted_file(f, Path(roots[r]), whole[r]):
+                            current[str(f)] = r
+                scope |= set(store.live_ids(under=target))
+                if (i := store.path_id(target)) is not None:
+                    scope.add(i)
+        for f in files:
+            r = root_index(f)
+            if r is None:
+                continue
+            if (i := store.path_id(f)) is not None:
+                scope.add(i)
+            if wanted_file(Path(f), Path(roots[r]), whole[r]):
+                current[f] = r
+        paths = store.manifest["paths"]
+        removed = [i for i in scope if paths[i] not in current]
+        changed = []
+        for i in scope:
+            if paths[i] in current:
+                old, now = store.stamp(i), _stamp(paths[i])
+                if abs(old[0] - now[0]) > 1e-3 or old[1] != now[1]:
+                    changed.append(i)
+        new = [p for p in current if store.path_id(p) is None]
+        if not (removed or changed or new):
+            return True
+        prev_state = index_state
+        index_state = "updating"
+        by_root: dict[int, list[Path]] = {}
+        for p in new + [paths[i] for i in changed]:
+            by_root.setdefault(current[p], []).append(Path(p))
+        try:
+            added = _extract(by_root)
+            store.apply_changes(added, removed + changed)
+        except Exception as e:
+            index_state, index_error = prev_state, None
+            log.warning("Index update failed: %s: %s", type(e).__name__, e)
+            return True
+        log.info("Index updated: %d new, %d changed, %d removed", len(new), len(changed), len(removed))
+        _start_embedding()
+        return True
+    finally:
+        index_lock.release()
+
+
+watcher = FolderWatcher(reconcile)
+
+
+def _sync_watching() -> None:
+    """Watch exactly the indexed folders."""
+    try:
+        watcher.watch(store.roots())
+    except Exception as e:  # e.g. too many folders for the OS watcher; the startup scan still catches up
+        log.warning("Could not watch folders: %s", e)
+
+
 def _restore_from_disk() -> None:
-    """Reload the last index; finish embedding it if the server stopped part way (resumes after the files that
-    were already embedded)."""
-    if store.load() and not store.embedding_complete():
+    """Reload the last index, finish embedding it if the server stopped part way, then catch up on files that
+    changed while ReFinder was closed and start watching for new changes."""
+    if not store.load():
+        return
+    if not store.embedding_complete():
         _start_embedding()
 
+    def catch_up() -> None:
+        for _ in range(60):  # wait out a running /index
+            if reconcile(set(), set(store.roots())):
+                break
+            time.sleep(5)
+        _sync_watching()
 
+    threading.Thread(target=catch_up, daemon=True, name="refinder-catch-up").start()
+
+
+def _exit_with_parent() -> None:
+    """When started by the desktop app (REFINDER_PARENT_PID), quit if the app goes away, even after a crash."""
+    pid = int(os.environ.get("REFINDER_PARENT_PID", "0") or 0)
+    if not pid:
+        return
+
+    def loop() -> None:
+        while True:
+            time.sleep(2)
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                os._exit(0)
+            except PermissionError:
+                pass
+
+    threading.Thread(target=loop, daemon=True, name="refinder-parent-watch").start()
+
+
+_exit_with_parent()
 _restore_from_disk()
 
 
@@ -182,26 +322,28 @@ def index_folder(request: IndexRequest) -> IndexResponse:
         index_state, index_error = "extracting", None
         files = list_files(folder, whole_computer=request.whole_computer)
         if adding:  # never re-read files that are already indexed (e.g. a parent of an indexed folder)
-            known = set(store.manifest["paths"])
+            known = set(store.keyword["path_id"])
             files = [f for f in files if str(f) not in known]
             if not files:
                 index_state = prev_state
                 return IndexResponse(status="unchanged", files_queued=0, total_files=len(known), failed=0,
                                      extract_s=0.0)
         workers = min(8, os.cpu_count() or 1) if len(files) >= PARALLEL_MIN_FILES else 1
-        new_paths, _, new_pieces, stats = load_corpus(folder, workers=workers, files=files)
+        new_paths, _, new_pieces, stats = load_corpus(folder, workers=workers, files=files,
+                                                      use_cache=USE_EXTRACT_CACHE)
         if not new_paths:
             index_state = prev_state if adding else "idle"
             raise HTTPException(status_code=400, detail="Folder contains no supported files")
         abs_paths = [str(folder / p) for p in new_paths]
         piece_texts = [[p.text for p in ps] for ps in new_pieces]
         if adding:
-            store.add(folder, abs_paths, piece_texts)
+            store.add(folder, abs_paths, piece_texts, whole=request.whole_computer)
         else:
             if embedder is not None and embedder.model_name != MODEL_NAME:
                 embedder = None  # index built with an older model: switch to the current one
-            store.replace(folder, abs_paths, piece_texts, MODEL_NAME)
+            store.replace(folder, abs_paths, piece_texts, MODEL_NAME, whole=request.whole_computer)
         _start_embedding()
+        _sync_watching()
     except HTTPException:
         raise
     except Exception as e:
@@ -210,16 +352,33 @@ def index_folder(request: IndexRequest) -> IndexResponse:
     finally:
         index_lock.release()
 
-    return IndexResponse(status="searchable", files_queued=len(new_paths), total_files=len(store.manifest["paths"]),
+    return IndexResponse(status="searchable", files_queued=len(new_paths), total_files=store.live_count(),
                          failed=len(stats["failed"]),
                          extract_s=round(stats["extract_s"], 2))
 
 
-@app.get("/search", response_model=SearchResponse)
-def search(
-    q: str = "",
-    k: int = Query(default=5, ge=1, le=100),
-    mode: str = Query(default="smart", pattern="^(smart|keyword)$"),
+@app.post("/folders/remove")
+def remove_folder(request: RemoveFolderRequest) -> dict[str, Any]:
+    """Stop searching one indexed folder. Its files and vectors are dropped; other folders are untouched."""
+    global index_state, index_error
+    if not index_lock.acquire(timeout=30):
+        raise HTTPException(status_code=409, detail="Busy indexing; try again shortly")
+    try:
+        try:
+            generation = store.remove_root(request.folder)
+        except KeyError:
+            raise HTTPException(status_code=404, detail="That folder isn't indexed")
+        if generation is None:
+            index_state, index_error = "idle", None
+        elif not store.embedding_complete():
+            _start_embedding()
+    finally:
+        index_lock.release()
+    _sync_watching()
+    return {"folders": store.roots(), "indexed_files": store.live_count()}
+
+
+def filter_params(
     types: str | None = Query(default=None, description="Comma-separated extensions, e.g. pdf,docx"),
     modified_after: float | None = Query(default=None, description="Unix seconds"),
     modified_before: float | None = None,
@@ -228,17 +387,37 @@ def search(
     min_size: int | None = Query(default=None, ge=0, description="Bytes"),
     max_size: int | None = Query(default=None, ge=0),
     folder: str | None = Query(default=None, description="Substring of the file's folder path"),
-) -> SearchResponse:
-    """mode=smart: filename + phrase + keyword + meaning. mode=keyword: plain BM25 keyword match only.
-    Filters narrow either mode; with filters and no query, lists matching files newest first."""
-    if not store.ready():
-        raise HTTPException(status_code=409, detail="Index a folder before searching")
-    filters = Filters(
+) -> Filters:
+    return Filters(
         types={t.strip().lower().lstrip(".") for t in types.split(",") if t.strip()} if types else None,
         modified_after=modified_after, modified_before=modified_before,
         added_after=added_after, added_before=added_before,
         min_size=min_size, max_size=max_size, folder=folder or None,
     )
+
+
+def _encode(text: str):
+    if not store.count():  # skip loading the model while only keyword search is available
+        return None
+    enc = _get_embedder()
+    with model_lock:
+        return enc.encode_query(text)
+
+
+@app.get("/search", response_model=SearchResponse)
+def search(
+    q: str = "",
+    k: int = Query(default=5, ge=1, le=100),
+    mode: str = Query(default="smart", pattern="^(smart|keyword)$"),
+    filters: Filters = Depends(filter_params),
+) -> SearchResponse:
+    """mode=smart: filename + phrase + keyword + meaning, plus file-type/date hints read from the query ("tax pdf
+    from last year"). mode=keyword: plain BM25 keyword match only. Filters narrow either mode; with filters and no
+    query, lists matching files newest first."""
+    from evaluation.query_meta import RECENT, parse
+
+    if not store.ready():
+        raise HTTPException(status_code=409, detail="Index a folder before searching")
     if not q.strip():
         if not filters.active():
             raise HTTPException(status_code=422, detail="Enter a search or set a filter")
@@ -246,19 +425,31 @@ def search(
     if mode == "keyword":
         return SearchResponse(results=[SearchResult(**hit) for hit in store.keyword_search(q, k=k, filters=filters)],
                               suggestion=store.suggest(q))
-    query_vec = None
-    if store.count():  # skip loading the model while only keyword search is available
-        enc = _get_embedder()
-        with model_lock:
-            query_vec = enc.encode_query(q)
-    return SearchResponse(results=[SearchResult(**hit) for hit in store.search(q, query_vec, k=k, filters=filters)])
+    meta = parse(q)
+    if meta.active() and not meta.content:  # only hints, e.g. "pdfs from last week"
+        hits = store.browse_meta(meta, filters, k=k)
+    else:
+        # Search the full wording: "during May" or "pitch deck" often describe the content too. The hints only add
+        # a small boost for files of that type or date.
+        # "recent"/"latest" only ask for newer files, so they are left out of the text itself.
+        text = " ".join(RECENT.sub(" ", q).split()) if meta.recent else q
+        hits = store.search(text or q, _encode(text or q), k=k, filters=filters, meta=meta)
+    return SearchResponse(results=[SearchResult(**hit) for hit in hits], understood=meta.labels)
+
+
+@app.get("/similar", response_model=SearchResponse)
+def similar(path: str, k: int = Query(default=20, ge=1, le=100),
+            filters: Filters = Depends(filter_params)) -> SearchResponse:
+    """"More like this": files most similar to an indexed file."""
+    _indexed_file(path)
+    return SearchResponse(results=[SearchResult(**hit) for hit in store.similar(path, k=k, filters=filters)])
 
 
 @app.get("/status", response_model=StatusResponse)
 def status() -> StatusResponse:
     roots = store.roots()
     return StatusResponse(
-        indexed_files=len(store.manifest["paths"]) if store.manifest else 0,
+        indexed_files=store.live_count(),
         chunks=store.count(),
         state=index_state,
         embedded_chunks=store.embedded_chunks,

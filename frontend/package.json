@@ -9,7 +9,8 @@
     "prebuild": "node scripts/copy-pdfjs-assets.mjs",
     "postinstall": "node scripts/copy-pdfjs-assets.mjs",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "build:app": "bash ../packaging/build_backend.sh && tauri build --config src-tauri/tauri.backend.conf.json"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",

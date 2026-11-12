@@ -70,6 +70,7 @@ function Icon({ name }: { name: string }) {
     expand: <path d="M14 4h6v6M10 20H4v-6M20 4l-7 7M4 20l7-7"/>,
     shrink: <path d="M20 10h-6V4M4 14h6v6M14 10l7-7M10 14l-7 7"/>,
     swap: <path d="M7 4 3 8l4 4M3 8h14M17 20l4-4-4-4M21 16H7"/>,
+    similar: <><rect x="3" y="3" width="11" height="14" rx="2"/><rect x="10" y="7" width="11" height="14" rx="2"/></>,
     computer: <><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></>,
     keyword: <><path d="M4 7V5h16v2M12 5v14M9 19h6"/></>,
   };
@@ -89,6 +90,8 @@ function App() {
   const [busy, setBusy] = useState(false);
   const [searched, setSearched] = useState(false);
   const [suggestion, setSuggestion] = useState<string | null>(null);
+  const [understood, setUnderstood] = useState<string[]>([]);  // hints read from the query, e.g. ["PDF", "from 2025"]
+  const [similarTo, setSimilarTo] = useState<string | null>(null);  // showing "More like this" for this path
   const [filters, setFilters] = useState<Filters>(noFilters);
   const [sort, setSort] = useState<SortKey>('relevance');
   const filtersOn = filterParams(filters) !== '';
@@ -115,9 +118,37 @@ function App() {
   async function refreshStatus() {
     try { setStatus(await request<Status>('/status')); } catch { setStatus(null); }
   }
-  useEffect(() => { void refreshStatus(); }, []);
+  // The desktop app starts the backend itself; keep checking for up to two minutes while it starts.
+  const [starting, setStarting] = useState(true);
+  useEffect(() => {
+    let tries = 0, stopped = false;
+    async function poll() {
+      while (!stopped && tries++ < 120) {
+        try { setStatus(await request<Status>('/status')); setStarting(false); return; } catch { /* not up yet */ }
+        await new Promise(r => setTimeout(r, 1000));
+      }
+      if (!stopped) setStarting(false);
+    }
+    void poll();
+    return () => { stopped = true; };
+  }, []);
   // Files are keyword-searchable as soon as /index returns; meaning-based results fill in while embedding runs.
-  const indexing = status?.state === 'extracting' || status?.state === 'embedding';
+  const indexing = status?.state === 'extracting' || status?.state === 'embedding' || status?.state === 'updating';
+  // "Understanding" = embedding chunks for meaning search. Track the rate between polls for a time-left estimate.
+  const embedding = status?.state === 'embedding' && (status.total_chunks || 0) > 0;
+  const embedPct = embedding ? Math.min(100, (100 * status!.embedded_chunks) / status!.total_chunks) : 0;
+  const embedStart = useRef<{ t: number; done: number; total: number } | null>(null);
+  const [etaSeconds, setEtaSeconds] = useState<number | null>(null);
+  useEffect(() => {
+    if (!embedding || !status) { embedStart.current = null; setEtaSeconds(null); return; }
+    const now = Date.now() / 1000, start = embedStart.current;
+    if (!start || start.total !== status.total_chunks || status.embedded_chunks < start.done) {
+      embedStart.current = { t: now, done: status.embedded_chunks, total: status.total_chunks }; setEtaSeconds(null); return;
+    }
+    const rate = (status.embedded_chunks - start.done) / Math.max(1, now - start.t);
+    setEtaSeconds(rate > 0 && now - start.t >= 3 ? (status.total_chunks - status.embedded_chunks) / rate : null);
+  }, [embedding, status]);
+  const etaText = etaSeconds === null ? '' : etaSeconds < 60 ? 'less than a minute left' : `about ${Math.round(etaSeconds / 60)} min left`;
   useEffect(() => { if (!indexing) return; const t = setInterval(() => void refreshStatus(), 1000); return () => clearInterval(t); }, [indexing]);
   useEffect(() => {
     function shortcut(e: KeyboardEvent) {
@@ -140,12 +171,22 @@ function App() {
     const fp = filterParams(f);
     if ((!q.trim() && !fp) || busy) return;
     // Clear the previous results right away so they never linger under a new query.
-    setBusy(true); setError(''); setSearched(true); setPreviewOpen(false); setSuggestion(null); setResults([]); setSelected(null);
-    try { const data = await request<{ results: Result[]; suggestion?: string | null }>(`/search?q=${encodeURIComponent(q.trim())}&k=${q.trim() ? 20 : 100}&mode=${m}${fp ? `&${fp}` : ''}`); setResults(data.results); setSelected(data.results[0] || null); setSuggestion(data.suggestion ?? null); }
+    setBusy(true); setError(''); setSearched(true); setPreviewOpen(false); setSuggestion(null); setUnderstood([]); setSimilarTo(null); setResults([]); setSelected(null);
+    try { const data = await request<{ results: Result[]; suggestion?: string | null; understood?: string[] }>(`/search?q=${encodeURIComponent(q.trim())}&k=${q.trim() ? 20 : 100}&mode=${m}${fp ? `&${fp}` : ''}`); setResults(data.results); setSelected(data.results[0] || null); setSuggestion(data.suggestion ?? null); setUnderstood(data.understood ?? []); }
     catch (e) { setResults([]); setSelected(null); setError(e instanceof Error ? e.message : 'Search failed'); }
     finally { setBusy(false); }
   }
   function search(e: React.FormEvent) { e.preventDefault(); void runSearch(mode); }
+  // "More like this": files similar to one result (by meaning and distinctive words), within the current filters.
+  async function moreLikeThis(path: string) {
+    if (busy) return;
+    const fp = filterParams(filters);
+    setBusy(true); setError(''); setSearched(true); setPreviewOpen(false); setExpanded(false); setSuggestion(null); setUnderstood([]); setResults([]); setSelected(null); setSimilarTo(path);
+    try { const data = await request<{ results: Result[] }>(`/similar?path=${encodeURIComponent(path)}&k=20${fp ? `&${fp}` : ''}`); setResults(data.results); setSelected(data.results[0] || null); }
+    catch (e) { setError(e instanceof Error ? e.message : 'Could not find similar files'); }
+    finally { setBusy(false); }
+  }
+  function backToSearch() { setSimilarTo(null); if (query.trim()) void runSearch(mode); else { setResults([]); setSelected(null); setSearched(false); } }
   // Changing a filter re-runs the current search (debounced for typing in the folder box).
   function updateFilters(next: Filters) {
     setFilters(next);
@@ -207,11 +248,23 @@ function App() {
     if (mode === 'replace' && status?.indexed_files && !window.confirm(`Search only this folder? The ${folders.length > 1 ? `${folders.length} folders` : 'folder'} indexed now will be removed from search.`)) return;
     await startIndex({ folder: path, mode }, path);
   }
+  // Removing a folder drops only its files from search; the files on disk are untouched.
+  async function removeFolder(f: string) {
+    const name = isHome(f) ? 'your whole computer' : `“${filename(f)}”`;
+    if (!window.confirm(`Stop searching ${name}? Its files stay on your computer; they just won't show up in ReFinder.`)) return;
+    setBusy(true); setError('');
+    try {
+      await request('/folders/remove', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ folder: f }) });
+      if (folder === f) setFolder('');
+      setResults([]); setSelected(null); setSearched(false);
+    } catch (e) { setError(e instanceof Error ? e.message : 'Could not remove the folder'); }
+    finally { setBusy(false); await refreshStatus(); }
+  }
   async function indexWholeComputer() {
     if (!window.confirm('Add every supported document in your home folder? Apps, system, hidden and code-dependency folders are skipped. Files already indexed are not read again. This can take several minutes.')) return;
     await startIndex({ whole_computer: true, mode: 'add' }, '');
   }
-  const statusText = busy && !indexing ? 'Working…' : !status ? 'Backend unavailable' : status.state === 'extracting' ? 'Reading files…' : status.state === 'embedding' ? `${status.indexed_files.toLocaleString()} files · understanding ${status.total_chunks ? Math.floor(100 * status.embedded_chunks / status.total_chunks) : 0}%` : status.state === 'error' ? (status.error || 'Indexing error') : status.indexed_files ? `${status.indexed_files.toLocaleString()} files indexed` : 'No folder indexed';
+  const statusText = busy && !indexing ? 'Working…' : !status ? (starting ? 'Starting search engine…' : 'Backend unavailable') : status.state === 'extracting' ? 'Reading files…' : status.state === 'updating' ? 'Updating changed files…' : status.state === 'embedding' ? `${status.indexed_files.toLocaleString()} files · understanding ${status.total_chunks ? Math.floor(100 * status.embedded_chunks / status.total_chunks) : 0}%` : status.state === 'error' ? (status.error || 'Indexing error') : status.indexed_files ? `${status.indexed_files.toLocaleString()} files indexed` : 'No folder indexed';
   const selectResult = (result: Result) => { setSelected(result); if (window.innerWidth < 820) setPreviewOpen(true); };
   async function openFile(path: string, reveal = false, app?: string) {
     try { await request('/open', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path, reveal, app }) }); }
@@ -244,6 +297,7 @@ function App() {
       {selected && <div className="preview-actions">
         <div className="segmented" role="tablist"><button role="tab" aria-selected={previewTab === 'document'} className={previewTab === 'document' ? 'active' : ''} onClick={() => setPreviewTab('document')}>Document</button><button role="tab" aria-selected={previewTab === 'text'} className={previewTab === 'text' ? 'active' : ''} onClick={() => setPreviewTab('text')}>Text</button></div>
         {previewTab === 'document' && ['pdf', 'docx'].includes(selected.type) && <div className="zoom"><button className="icon-button" onClick={() => setZoom(z => Math.max(0.5, +(z - 0.25).toFixed(2)))} aria-label="Zoom out" title="Zoom out">−</button><span>{Math.round(zoom * 100)}%</span><button className="icon-button" onClick={() => setZoom(z => Math.min(3, +(z + 0.25).toFixed(2)))} aria-label="Zoom in" title="Zoom in">+</button></div>}
+        <button className="icon-button" onClick={() => void moreLikeThis(selected.path)} title="More like this" aria-label="More like this"><Icon name="similar"/></button>
         <button className="icon-button" onClick={() => void openFile(selected.path, true)} title="Show in Finder" aria-label="Show in Finder"><Icon name="reveal"/></button>
         <button className="icon-button" onClick={toggleExpanded} title={expanded ? 'Exit full view' : 'Full view'} aria-label={expanded ? 'Exit full view' : 'Full view'}><Icon name={expanded ? 'shrink' : 'expand'}/></button>
         <div className="open-split" ref={openWithRef}>
@@ -263,7 +317,7 @@ function App() {
       <button className="icon-button preview-close" onClick={() => { setPreviewOpen(false); setExpanded(false); }} aria-label="Close preview"><Icon name="close" /></button>
     </div>
     {selected ? <div className="preview-body">
-      <div className="preview-meta"><span className="path">{directory(selected.path)}</span><span>{query.trim() && <span className="score">Relevance {selected.score.toFixed(3)} · </span>}Modified {formatDate(selected.modified)} · Added {formatDate(selected.added)} · {formatSize(selected.size)}</span></div>
+      <div className="preview-meta"><span className="path">{directory(selected.path)}</span><span>{(query.trim() || similarTo) && <span className="score">{similarTo ? 'Similarity' : 'Relevance'} {selected.score.toFixed(3)} · </span>}Modified {formatDate(selected.modified)} · Added {formatDate(selected.added)} · {formatSize(selected.size)}</span></div>
       {previewTab === 'document'
         ? <DocumentView key={selected.path} api={API} path={selected.path} query={query} passage={selected.passage || selected.snippet} fallbackText={fileText} zoom={zoom}/>
         : fileText ? <TextBlocks text={fileText} query={query} passage={selected.passage || selected.snippet}/> : <p className="file-text">Loading extracted text…</p>}
@@ -271,16 +325,24 @@ function App() {
   </section>;
   return <div className={`app ${collapsed ? 'sidebar-collapsed' : ''}`}>
     <aside className="sidebar"><div className="sidebar-head"><span className="brand">ReFinder</span><button className="icon-button collapse-button" title={collapsed ? 'Expand sidebar' : 'Collapse sidebar'} aria-label={collapsed ? 'Expand sidebar' : 'Collapse sidebar'} onClick={() => setCollapsed(!collapsed)}><Icon name="sidebar"/></button></div>
-      <div className="sidebar-scroll"><p className="section-label">LIBRARY</p><button className={`nav-item ${mode === 'smart' ? 'active' : ''}`} title="Search" onClick={() => switchMode('smart')}><Icon name="search"/><span>Search</span></button><button className={`nav-item ${mode === 'keyword' ? 'active' : ''}`} title="Keyword search" onClick={() => switchMode('keyword')}><Icon name="keyword"/><span>Keyword search</span></button><p className="section-label folder-label">FOLDER</p>{folders.map(f => <div key={f} className="nav-item folder-item" title={f}><Icon name={isHome(f) ? 'computer' : 'folder'}/><span>{isHome(f) ? 'Whole computer' : filename(f)}</span></div>)}<button className="nav-item" title="Add a folder to search" onClick={() => chooseFolder(folders.length ? 'add' : 'replace')} disabled={busy}><Icon name="plus"/><span>{folders.length ? 'Add folder' : 'Choose folder'}</span></button>{folders.length > 0 && <button className="nav-item" title="Search a different folder instead" onClick={() => chooseFolder('replace')} disabled={busy}><Icon name="swap"/><span>Replace all</span></button>}<button className="nav-item" title="Index whole computer" onClick={indexWholeComputer} disabled={busy}><Icon name="computer"/><span>Index whole computer</span></button></div>
-      <div className="sidebar-bottom"><div className="index-status" title={statusText}><span className={`status-dot ${status ? 'online' : ''}`}/><span>{statusText}</span></div><button className="nav-item" title="Settings" onClick={() => setSettingsOpen(true)}><Icon name="settings"/><span>Settings</span></button></div>
+      <div className="sidebar-scroll"><p className="section-label">LIBRARY</p><button className={`nav-item ${mode === 'smart' ? 'active' : ''}`} title="Search" onClick={() => switchMode('smart')}><Icon name="search"/><span>Search</span></button><button className={`nav-item ${mode === 'keyword' ? 'active' : ''}`} title="Keyword search" onClick={() => switchMode('keyword')}><Icon name="keyword"/><span>Keyword search</span></button><p className="section-label folder-label">FOLDER</p>{folders.map(f => <div key={f} className="nav-item folder-item" title={f}><Icon name={isHome(f) ? 'computer' : 'folder'}/><span>{isHome(f) ? 'Whole computer' : filename(f)}</span><button className="folder-remove" onClick={() => void removeFolder(f)} disabled={busy} aria-label={`Stop searching ${filename(f)}`} title="Remove from search"><Icon name="close"/></button></div>)}<button className="nav-item" title="Add a folder to search" onClick={() => chooseFolder(folders.length ? 'add' : 'replace')} disabled={busy}><Icon name="plus"/><span>{folders.length ? 'Add folder' : 'Choose folder'}</span></button>{folders.length > 0 && <button className="nav-item" title="Search a different folder instead" onClick={() => chooseFolder('replace')} disabled={busy}><Icon name="swap"/><span>Replace all</span></button>}<button className="nav-item" title="Index whole computer" onClick={indexWholeComputer} disabled={busy}><Icon name="computer"/><span>Index whole computer</span></button></div>
+      <div className="sidebar-bottom">{embedding && <div className="embed-progress" title={`${status!.embedded_chunks.toLocaleString()} of ${status!.total_chunks.toLocaleString()} passages understood`}>
+        <div className="embed-progress-label"><span>Understanding files</span><span>{Math.floor(embedPct)}%</span></div>
+        <div className="progress-track" role="progressbar" aria-label="Understanding files" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.floor(embedPct)}><div className="progress-fill" style={{ width: `${embedPct}%` }}/></div>
+        <div className="embed-progress-sub">{etaText || 'Keyword search works now; results get smarter as this finishes.'}</div>
+      </div>}<div className="index-status" title={statusText}><span className={`status-dot ${status ? 'online' : ''}`}/><span>{embedding && !collapsed ? `${status!.indexed_files.toLocaleString()} files indexed` : statusText}</span></div><button className="nav-item" title="Settings" onClick={() => setSettingsOpen(true)}><Icon name="settings"/><span>Settings</span></button></div>
     </aside>
-    <main className="workspace"><header className="page-heading"><h1>{mode === 'keyword' ? 'Keyword search' : 'Search'}</h1><span className="shortcut">⌘ K</span></header><form className="search-box" onSubmit={search}><Icon name="search"/><input ref={inputRef} value={query} onChange={e => setQuery(e.target.value)} placeholder={mode === 'keyword' ? 'Find files containing these words' : 'Search your files by meaning'} aria-label="Search your files"/><button type="submit" disabled={busy || (!query.trim() && !filtersOn)}>Search</button></form>
+    <main className="workspace">{(embedding || status?.state === 'extracting' || status?.state === 'updating') && <div className={`top-progress ${embedding ? '' : 'indeterminate'}`} aria-hidden="true"><div style={embedding ? { width: `${embedPct}%` } : undefined}/></div>}<header className="page-heading"><h1>{mode === 'keyword' ? 'Keyword search' : 'Search'}</h1><span className="shortcut">⌘ K</span></header><form className="search-box" onSubmit={search}><Icon name="search"/><input ref={inputRef} value={query} onChange={e => setQuery(e.target.value)} placeholder={mode === 'keyword' ? 'Find files containing these words' : 'Search your files by meaning'} aria-label="Search your files"/><button type="submit" disabled={busy || (!query.trim() && !filtersOn)}>Search</button></form>
       {filterBar}
       <div className="scope-row"><span title={folders.join('\n')}>{folderLabel || 'All indexed files'}</span><span>{busy ? 'Searching or indexing…' : statusText}</span></div>
       {error && <div className="error" role="alert">{error === 'Failed to fetch' ? 'Could not connect to the local ReFinder server. Start the backend and try again.' : error}</div>}
       {mode === 'keyword' && suggestion && !busy && <div className="suggestion">Did you mean <button type="button" onClick={acceptSuggestion}>{suggestion}</button>?</div>}
+      {(understood.length > 0 || similarTo) && <div className="understood">
+        {similarTo ? <><span>More like <strong title={similarTo}>{filename(similarTo)}</strong></span><button type="button" className="link-button" onClick={backToSearch}>{query.trim() ? 'Back to search' : 'Clear'}</button></>
+          : <><span>Searching for</span>{understood.map(u => <span key={u} className="chip">{u}</span>)}</>}
+      </div>}
       <div className="results-heading"><span>{busy && searched ? 'Searching…' : searched ? `${results.length} ${results.length === 1 ? 'result' : 'results'}` : 'Your results'}</span><label className="sort">Sort by <select value={sort} onChange={e => setSort(e.target.value as SortKey)}><option value="relevance">{query.trim() ? (mode === 'keyword' ? 'Keyword match' : 'Relevance') : 'Newest modified'}</option><option value="modified">Date modified</option><option value="added">Date added</option><option value="name">Name</option><option value="size">Size</option></select></label></div>
-      <div className="content-grid"><section className="results panel" aria-label="Search results">{sortedResults.length ? sortedResults.map((result, i) => <button key={`${result.path}-${result.chunk_id}-${i}`} className={`result ${selected === result ? 'selected' : ''}`} onClick={() => selectResult(result)} onDoubleClick={() => void openFile(result.path)} title="Double-click to open"><span className="file-icon">{typeLabel(result.path)}</span><span className="result-content"><strong>{filename(result.path)}</strong><span className="path">{directory(result.path)}</span><span className="snippet">{result.snippet}</span><span className="meta">{query.trim() && <span className="score">Relevance {result.score.toFixed(3)}</span>}<span>Modified {formatDate(result.modified)}</span><span>Added {formatDate(result.added)}</span><span>{formatSize(result.size)}</span></span></span></button>) : <div className="empty-state"><div className="empty-icon"><Icon name="search"/></div><h2>{busy ? 'Searching…' : searched ? 'No results found' : 'Find what you remember'}</h2><p>{busy ? 'This may take a moment while the model loads.' : searched ? (filtersOn ? 'No files match these filters. Try loosening or clearing them.' : mode === 'keyword' ? 'No file contains these words. Check the spelling or try Search.' : 'Try a different description or choose another folder.') : status?.indexed_files ? 'Describe the content you’re looking for.' : 'Choose a folder, then describe the content you’re looking for.'}</p>{!status?.indexed_files && <button className="primary-button" onClick={() => chooseFolder('replace')} disabled={busy}>Choose folder</button>}</div>}</section>{previewOpen ? <section className="preview panel"><div className="empty-preview">Showing in full view.</div></section> : preview}</div>
+      <div className="content-grid"><section className="results panel" aria-label="Search results">{sortedResults.length ? sortedResults.map((result, i) => <button key={`${result.path}-${result.chunk_id}-${i}`} className={`result ${selected === result ? 'selected' : ''}`} onClick={() => selectResult(result)} onDoubleClick={() => void openFile(result.path)} title="Double-click to open"><span className="file-icon">{typeLabel(result.path)}</span><span className="result-content"><strong>{filename(result.path)}</strong><span className="path">{directory(result.path)}</span><span className="snippet">{result.snippet}</span><span className="meta">{(query.trim() || similarTo) && <span className="score">{similarTo ? 'Similarity' : 'Relevance'} {result.score.toFixed(3)}</span>}<span>Modified {formatDate(result.modified)}</span><span>Added {formatDate(result.added)}</span><span>{formatSize(result.size)}</span></span></span></button>) : <div className="empty-state"><div className="empty-icon"><Icon name="search"/></div><h2>{busy ? 'Searching…' : searched ? 'No results found' : 'Find what you remember'}</h2><p>{busy ? 'This may take a moment while the model loads.' : searched ? (filtersOn ? 'No files match these filters. Try loosening or clearing them.' : mode === 'keyword' ? 'No file contains these words. Check the spelling or try Search.' : 'Try a different description or choose another folder.') : status?.indexed_files ? 'Describe the content you’re looking for.' : 'Choose a folder, then describe the content you’re looking for.'}</p>{!status?.indexed_files && <button className="primary-button" onClick={() => chooseFolder('replace')} disabled={busy}>Choose folder</button>}</div>}</section>{previewOpen ? <section className="preview panel"><div className="empty-preview">Showing in full view.</div></section> : preview}</div>
       <div className="compact-footer"><span>{selected ? filename(selected.path) : 'Select a result to preview'}</span><span className="footer-actions"><button onClick={() => selected && void openFile(selected.path)} disabled={!selected}>Open <span>⌘ O</span></button><button onClick={() => setPreviewOpen(true)} disabled={!selected}>Preview <span>⌘ Y</span></button></span></div>
     </main>
     {previewOpen && <div className={`preview-overlay ${expanded ? 'wide' : ''}`} onClick={() => { setPreviewOpen(false); setExpanded(false); }}><div className="preview-sheet" onClick={e => e.stopPropagation()}>{preview}</div></div>}

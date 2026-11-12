@@ -42,8 +42,8 @@ import csv
 import hashlib
 import itertools
 import json
-import pickle
 import os
+import pickle
 import random
 import sys
 import time
@@ -109,6 +109,31 @@ def _size(p: Path) -> int:
         return 0
 
 
+def skipped_dir(name: str) -> bool:
+    """Folders a whole-computer index never enters: hidden, system/app data, dependencies, app packages."""
+    return name.startswith(".") or name in SYSTEM_DIRS or name.endswith(PACKAGE_SUFFIXES)
+
+
+def wanted_file(path: Path, root: Path, whole_computer: bool = False) -> bool:
+    """Would list_files(root, whole_computer) include this file? Used to vet single changed files."""
+    from refinder.extract import SUPPORTED_SUFFIXES
+
+    try:
+        rel = path.relative_to(root)
+    except ValueError:
+        return False
+    if path.name.startswith((".", "~$")) or path.suffix.lower() not in SUPPORTED_SUFFIXES:
+        return False
+    if whole_computer and any(skipped_dir(part) for part in rel.parts[:-1]):
+        return False
+    try:
+        if path.is_symlink() and whole_computer:
+            return False
+        return path.is_file() and (not whole_computer or path.stat().st_size <= MAX_FILE_MB * 1e6)
+    except OSError:
+        return False
+
+
 def list_files(root: Path, whole_computer: bool = False) -> list[Path]:
     """Supported files under root, sorted. whole_computer skips hidden, system, app and dependency folders and
     files over MAX_FILE_MB, and never follows symlinks (they can loop or leave the home folder)."""
@@ -118,8 +143,7 @@ def list_files(root: Path, whole_computer: bool = False) -> list[Path]:
         return [p for p in sorted(root.rglob("*")) if p.is_file()]
     found = []
     for dirpath, dirnames, filenames in os.walk(root, onerror=lambda e: None):
-        dirnames[:] = [d for d in dirnames if not d.startswith(".") and d not in SYSTEM_DIRS
-                       and not d.endswith(PACKAGE_SUFFIXES)]
+        dirnames[:] = [d for d in dirnames if not skipped_dir(d)]
         for name in filenames:
             if name.startswith((".", "~$")) or Path(name).suffix.lower() not in SUPPORTED_SUFFIXES:
                 continue

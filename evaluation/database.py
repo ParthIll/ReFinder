@@ -27,6 +27,7 @@ import os
 import re
 import sys
 import threading
+import time
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -41,6 +42,7 @@ from chromadb.config import Settings
 from rapidfuzz import fuzz, process
 
 if TYPE_CHECKING:
+    from evaluation.query_meta import QueryMeta
     from refinder.embedder import Embedder
 
 
@@ -84,6 +86,15 @@ def file_meta(path: str) -> tuple[float, float, int]:
 _TYPE_ALIASES = {"markdown": "md", "htm": "html", "jpeg": "jpg"}
 
 
+def _stamp(path: str) -> tuple[float, int]:
+    """(modified time, size), used to notice files that changed since they were indexed."""
+    try:
+        st = os.stat(path)
+        return st.st_mtime, st.st_size
+    except OSError:
+        return 0.0, -1
+
+
 def file_type(path: str) -> str:
     ext = Path(path).suffix.lower().lstrip(".") or "other"
     return _TYPE_ALIASES.get(ext, ext)
@@ -106,7 +117,9 @@ class Filters:
         return any(v not in (None, "", set()) for v in vars(self).values())
 
 COLLECTION_NAME = "refinder"
-DEFAULT_PERSIST_DIR = Path(__file__).resolve().parent / "chroma_db"
+# The desktop app passes a per-user data folder; running from the repo keeps the index in evaluation/chroma_db.
+DEFAULT_PERSIST_DIR = (Path(os.environ["REFINDER_DATA_DIR"]) / "chroma_db" if os.environ.get("REFINDER_DATA_DIR")
+                       else Path(__file__).resolve().parent / "chroma_db")
 MANIFEST_NAME = "manifest.json"
 EMBED_BATCH = 256  # chunks per encode + Chroma add; also how often embedding checks for cancellation
 MAX_CHUNKS_PER_FILE = 20  # long files: first 10 chunks + 10 spread over the rest; BM25 still sees the full text
@@ -123,7 +136,15 @@ W_DENSE = 1.0
 # Filename share is raised to this power: a name covering the whole query keeps the full boost, one sharing a
 # couple of words with a long question (a client name, say) barely moves it.
 NAME_POW = 2
-SHORT_QUERY_WORDS = 3  # queries this short are usually name lookups: their filename share counts linearly
+SHORT_QUERY_WORDS = 3
+# Boosts for hints read from the query ("pdf", "from last week", "recent"; see query_meta.py). They only lift files
+# that already match the content (about two top RRF ranks each), so a matching PDF beats a non-PDF of similar
+# relevance without letting any PDF outrank a much better match.
+W_META_TYPE = 0.03
+W_META_DATE = 0.02
+W_RECENT = 0.06  # "latest X": among files matching X (>= half the top score), newer ones first
+RECENT_DAYS = 60
+MLT_TERMS = 15  # distinctive words of a file used for keyword-based "more like this"  # queries this short are usually name lookups: their filename share counts linearly
 FUZZY_MIN_LEN = 4  # shorter words only match exactly ("tax" must not fuzzy-match "tex")
 FUZZY_CUTOFF = 85  # rapidfuzz ratio, 0-100
 PHRASE_CANDIDATES = 300  # files (by BM25) checked for an exact phrase
@@ -187,6 +208,29 @@ class ChromaIndex:
     def roots(self) -> list[str]:
         return list(self.manifest["roots"]) if self.manifest else []
 
+    def whole_roots(self) -> list[bool]:
+        """Per root: indexed as a whole home folder (system/hidden folders skipped)?"""
+        return list(self.manifest.get("whole") or [False] * len(self.manifest["roots"])) if self.manifest else []
+
+    def live_count(self) -> int:
+        return int(self.keyword["alive"].sum()) if self.ready() else 0
+
+    def live_ids(self, under: str | None = None) -> list[int]:
+        """Ids of indexed (not deleted) files, optionally only those inside folder `under`."""
+        if not self.ready():
+            return []
+        paths, alive = self.manifest["paths"], self.keyword["alive"]
+        prefix = under.rstrip(os.sep) + os.sep if under else None
+        return [i for i in np.flatnonzero(alive).tolist() if prefix is None or paths[i].startswith(prefix)]
+
+    def stamp(self, doc_id: int) -> tuple[float, int]:
+        """(modified time, size) of the file when it was indexed."""
+        st = self.manifest["stamps"][doc_id]
+        return float(st[0]), int(st[1])
+
+    def path_id(self, path: str) -> int | None:
+        return self.keyword["path_id"].get(path) if self.ready() else None
+
     def _write_manifest(self) -> None:
         self.manifest["embedding_complete"] = self.embedding_complete()
         self.manifest["embedded_docs"] = self.embedded_docs
@@ -206,6 +250,10 @@ class ChromaIndex:
             data["roots"], data["root_of"] = [root], [0] * len(data["paths"])
             data["paths"] = [str(Path(root) / p) for p in data["paths"]]
             data["embedded_docs"] = len(data["paths"]) if data.get("embedding_complete") else 0
+        data.setdefault("deleted", [])
+        data.setdefault("whole", [False] * len(data["roots"]))
+        if "stamps" not in data:  # older index: treat the files as unchanged since indexing
+            data["stamps"] = [list(_stamp(p)) for p in data["paths"]]
         self._set_keyword(data)
         self.embedded_docs = int(data.get("embedded_docs", 0))
         self.embedded_chunks = self.count()
@@ -219,14 +267,17 @@ class ChromaIndex:
 
     def _set_keyword(self, manifest: dict[str, Any]) -> None:
         """Build BM25 and the filename/filter tables over every file in the manifest (paths are absolute)."""
-        texts = ["\n\n".join(ps) for ps in manifest["pieces"]]
+        n = len(manifest["paths"])
+        alive = np.ones(n, dtype=bool)
+        alive[manifest.get("deleted", [])] = False
+        texts = ["\n\n".join(ps) for ps in manifest["pieces"]]  # deleted files keep an empty slot
         tokenized = self._tokenize(texts)
         bm25 = bm25s.BM25()
         bm25.index(tokenized, show_progress=False)
         roots = manifest["roots"]
         # Folder words come from the path below the indexed folder, so e.g. "Users" never counts as a match.
-        rel = [os.path.relpath(p, roots[r]) for p, r in zip(manifest["paths"], manifest["root_of"])]
-        names = [_name_words(p) for p in rel]
+        names = [_name_words(os.path.relpath(p, roots[r])) if alive[i] else ([], [])
+                 for i, (p, r) in enumerate(zip(manifest["paths"], manifest["root_of"]))]
         keyword = {
             "vocab": [w for w in tokenized.vocab if w],  # stemmed index words, for typo correction
             "file_words": [set(f) for f, _ in names],
@@ -235,7 +286,8 @@ class ChromaIndex:
             "flat": [" ".join(_words(t)) for t in texts],  # for exact-phrase checks
         }
         # Dates and sizes are read fresh (cheap: a few ms per thousand files) rather than stored in the manifest.
-        meta = np.array([file_meta(p) for p in manifest["paths"]], dtype=np.float64).reshape(-1, 3)
+        meta = np.array([file_meta(p) if alive[i] else (0.0, 0.0, 0) for i, p in enumerate(manifest["paths"])],
+                        dtype=np.float64).reshape(-1, 3)
         keyword["modified"], keyword["added"], keyword["size"] = meta[:, 0], meta[:, 1], meta[:, 2]
         keyword["type"] = np.array([file_type(p) for p in manifest["paths"]])
         keyword["folder"] = [str(Path(p).parent).lower() for p in manifest["paths"]]
@@ -243,10 +295,14 @@ class ChromaIndex:
         freq = Counter(w for f in keyword["flat"] for w in f.split() if len(w) >= 3 and not w.isdigit())
         keyword["word_freq"] = freq
         keyword["words"] = list(freq)
+        keyword["alive"] = alive
+        # A changed file is re-added under a new id, so map each path to its live id.
+        keyword["path_id"] = {manifest["paths"][i]: i for i in np.flatnonzero(alive).tolist()}
         with self.lock:
             self.manifest, self.texts, self.bm25, self.keyword = manifest, texts, bm25, keyword
 
-    def replace(self, root: Path, paths: list[str], pieces: list[list[str]], model_name: str) -> int:
+    def replace(self, root: Path, paths: list[str], pieces: list[list[str]], model_name: str,
+                whole: bool = False) -> int:
         """Stage 1: replace the whole index with a keyword-only one over these files (absolute paths) from one
         folder. Returns the new generation."""
         with self.lock:
@@ -260,12 +316,13 @@ class ChromaIndex:
                 name=COLLECTION_NAME, embedding_function=None,
                 metadata={"hnsw:space": "cosine", "model_name": model_name})
             self.embedded_chunks = self.total_chunks = self.embedded_docs = 0
-        self._set_keyword({"roots": [str(root)], "root_of": [0] * len(paths), "model_name": model_name,
-                           "paths": paths, "pieces": pieces})
+        self._set_keyword({"roots": [str(root)], "whole": [whole], "root_of": [0] * len(paths),
+                           "model_name": model_name, "paths": paths, "pieces": pieces,
+                           "stamps": [list(_stamp(p)) for p in paths], "deleted": []})
         self._write_manifest()
         return generation
 
-    def add(self, root: Path, paths: list[str], pieces: list[list[str]]) -> int:
+    def add(self, root: Path, paths: list[str], pieces: list[list[str]], whole: bool = False) -> int:
         """Stage 1 for an extra folder: append these files (absolute paths, none already indexed) and rebuild the
         keyword index over everything. Existing files keep their ids and vectors; `embed` then only embeds the new
         files. A folder containing already-indexed folders absorbs them. Returns the new generation."""
@@ -274,20 +331,82 @@ class ChromaIndex:
         inside = lambda child, parent: child == parent or child.startswith(parent.rstrip(os.sep) + os.sep)
         # Indexed folders inside the new one merge into it; the new one inside an indexed folder adds no root.
         parent = next((i for i, r in enumerate(old["roots"]) if inside(root_s, r)), None)
+        old_whole = old.get("whole") or [False] * len(old["roots"])
         if parent is None:
-            roots = [r for r in old["roots"] if not inside(r, root_s)] + [root_s]
-            remap = {i: (roots.index(r) if r in roots else len(roots) - 1) for i, r in enumerate(old["roots"])}
-            root_of = [remap[r] for r in old["root_of"]] + [len(roots) - 1] * len(paths)
+            keep = [i for i, r in enumerate(old["roots"]) if not inside(r, root_s)]
+            roots = [old["roots"][i] for i in keep] + [root_s]
+            whole_flags = [old_whole[i] for i in keep] + [whole]
+            remap = {i: (keep.index(i) if i in keep else len(roots) - 1) for i in range(len(old["roots"]))}
+            root_of = [remap.get(r, -1) for r in old["root_of"]] + [len(roots) - 1] * len(paths)
         else:
-            roots, root_of = list(old["roots"]), list(old["root_of"]) + [parent] * len(paths)
-        manifest = {**old, "roots": roots, "root_of": root_of, "paths": old["paths"] + paths,
-                    "pieces": old["pieces"] + pieces}
+            roots, whole_flags = list(old["roots"]), list(old_whole)
+            root_of = list(old["root_of"]) + [parent] * len(paths)
+        manifest = {**old, "roots": roots, "whole": whole_flags, "root_of": root_of, "paths": old["paths"] + paths,
+                    "pieces": old["pieces"] + pieces, "stamps": old["stamps"] + [list(_stamp(p)) for p in paths]}
         with self.lock:
             self.generation += 1  # a running embed stops; the next one resumes from embedded_docs
             generation = self.generation
         self._set_keyword(manifest)
         self._write_manifest()
         return generation
+
+    def apply_changes(self, added: list[tuple[int, str, list[str]]], removed: list[int]) -> int:
+        """Incremental update: mark `removed` ids deleted (their vectors go) and append `added` files as
+        (root index, absolute path, pieces). A changed file is removed and added again under a new id, so only it
+        is re-embedded. Rebuilds the keyword index over everything; returns the new generation."""
+        old = self.manifest
+        removed = sorted(set(removed))
+        with self.lock:
+            self.generation += 1
+            generation = self.generation
+            if removed:
+                self.collection.delete(where={"doc_id": {"$in": removed}})
+                self.embedded_chunks = self.count()
+        pieces = list(old["pieces"])
+        for i in removed:
+            pieces[i] = []  # drop the text; the id stays so later ids and vectors don't move
+        manifest = {**old, "pieces": pieces + [p for _, _, p in added],
+                    "paths": old["paths"] + [p for _, p, _ in added],
+                    "root_of": old["root_of"] + [r for r, _, _ in added],
+                    "stamps": old["stamps"] + [list(_stamp(p)) for _, p, _ in added],
+                    "deleted": sorted(set(old.get("deleted", [])) | set(removed))}
+        self._set_keyword(manifest)
+        self._write_manifest()
+        return generation
+
+    def remove_root(self, root: str) -> int | None:
+        """Stop searching an indexed folder: its files are marked deleted and their vectors removed. Returns the
+        new generation, or None if that was the last folder (the index is then cleared)."""
+        roots = self.roots()
+        if root not in roots:
+            raise KeyError(root)
+        if len(roots) == 1:
+            self.clear()
+            return None
+        idx = roots.index(root)
+        gone = [i for i in self.live_ids() if self.manifest["root_of"][i] == idx]
+        generation = self.apply_changes([], gone)
+        m = self.manifest
+        m["roots"] = roots[:idx] + roots[idx + 1:]
+        m["whole"] = (m.get("whole") or [False] * len(roots))
+        m["whole"] = m["whole"][:idx] + m["whole"][idx + 1:]
+        m["root_of"] = [-1 if r == idx else (r - 1 if r > idx else r) for r in m["root_of"]]
+        self._write_manifest()
+        return generation
+
+    def clear(self) -> None:
+        """Forget everything: no folders, no vectors."""
+        with self.lock:
+            self.generation += 1
+            try:
+                self.client.delete_collection(COLLECTION_NAME)
+            except Exception:
+                pass
+            self.collection = self.client.get_or_create_collection(
+                name=COLLECTION_NAME, embedding_function=None, metadata={"hnsw:space": "cosine"})
+            self.manifest, self.texts, self.bm25, self.keyword = None, [], None, {}
+            self.embedded_chunks = self.total_chunks = self.embedded_docs = 0
+        self.manifest_path.unlink(missing_ok=True)
 
     def embed(self, embedder: "Embedder", generation: int, model_lock: threading.Lock,
               on_progress: Callable[[int, int], None] | None = None) -> None:
@@ -338,10 +457,8 @@ class ChromaIndex:
             self._write_manifest()
 
     def file_text(self, path: str) -> str | None:
-        try:
-            return self.texts[self.manifest["paths"].index(path)]
-        except (ValueError, TypeError):
-            return None
+        i = self.path_id(path)
+        return None if i is None else self.texts[i]
 
     # ------------------------------------------------------------ search
 
@@ -354,14 +471,14 @@ class ChromaIndex:
         """Indexed file count per type (extension), most common first."""
         if not self.ready():
             return {}
-        return dict(Counter(self.keyword["type"].tolist()).most_common())
+        return dict(Counter(self.keyword["type"][self.keyword["alive"]].tolist()).most_common())
 
     def filter_mask(self, f: Filters | None) -> np.ndarray | None:
         """Boolean mask of files passing the filters, or None when no filter is set."""
         if f is None or not f.active():
             return None
         kw = self.keyword
-        mask = np.ones(len(self.manifest["paths"]), dtype=bool)
+        mask = self.keyword["alive"].copy()
         if f.types:
             mask &= np.isin(kw["type"], list(f.types))
         for col, lo, hi in (("modified", f.modified_after, f.modified_before), ("added", f.added_after, f.added_before),
@@ -535,7 +652,7 @@ class ChromaIndex:
             return []
         scores = self.bm25.get_scores(tokens)
         mask = self.filter_mask(filters)
-        hits = np.flatnonzero((scores > 0) if mask is None else (scores > 0) & mask)
+        hits = np.flatnonzero((scores > 0) & (self.keyword["alive"] if mask is None else mask))
         top = hits[np.argsort(-scores[hits], kind="stable")][:k]
         best = float(scores[top[0]]) if len(top) else 1.0
         phrase = " ".join(_words(query))
@@ -547,18 +664,112 @@ class ChromaIndex:
                         **self._result_meta(f)})
         return out
 
+    def _meta_masks(self, meta: "QueryMeta") -> tuple[np.ndarray | None, np.ndarray | None]:
+        """(type match, date match) per file for the hints in a query; None where the query has no such hint."""
+        kw = self.keyword
+        types = np.isin(kw["type"], list(meta.types)) if meta.types else None
+        dates = None
+        if meta.after is not None or meta.before is not None:
+            lo = -np.inf if meta.after is None else meta.after
+            hi = np.inf if meta.before is None else meta.before
+            fields = {"modified": ["modified"], "added": ["added"]}.get(meta.date_field, ["modified", "added"])
+            dates = np.zeros(len(kw["alive"]), dtype=bool)
+            for col in fields:
+                dates |= (kw[col] >= lo) & (kw[col] <= hi)
+        return types, dates
+
+    def browse_meta(self, meta: "QueryMeta", filters: Filters | None, k: int = 20) -> list[dict[str, Any]]:
+        """A query that is only hints ("pdfs from last week"): matching files, newest first."""
+        mask = self.filter_mask(filters)
+        mask = self.keyword["alive"].copy() if mask is None else mask
+        types, dates = self._meta_masks(meta)
+        if types is not None:
+            mask &= types
+        if dates is not None:
+            mask &= dates
+        col = "added" if meta.date_field == "added" else "modified"
+        ids = np.flatnonzero(mask)
+        ids = ids[np.argsort(-self.keyword[col][ids], kind="stable")][:k]
+        out = []
+        for f in ids.tolist():
+            pieces = self.manifest["pieces"][f]
+            text = " ".join((pieces[0] if pieces else "").split())
+            out.append({"path": self.manifest["paths"][f], "score": 1.0, "chunk_id": None,
+                        "snippet": text[:SNIPPET_CHARS], "passage": "", **self._result_meta(f)})
+        return out
+
+    def similar(self, path: str, k: int = 10, filters: Filters | None = None) -> list[dict[str, Any]]:
+        """"More like this": files closest in meaning to this one (the average of its chunk vectors), fused with a
+        keyword search for its most distinctive words, so it also works before the file is embedded."""
+        f = self.path_id(path)
+        if f is None:
+            return []
+        mask = self.filter_mask(filters)
+        allowed = self.keyword["alive"].copy() if mask is None else mask
+        allowed[f] = False
+        score = np.zeros(len(allowed))
+        dense_hit: dict[int, tuple[str, int]] = {}
+        got = self.collection.get(where={"doc_id": f}, include=["embeddings"])
+        embs = got.get("embeddings")
+        if embs is not None and len(embs):
+            v = np.asarray(embs, dtype=np.float32).mean(axis=0)
+            v /= np.linalg.norm(v) or 1.0
+            for rank, (g, text, ci) in enumerate(
+                    (d for d in self._dense_ranking(v, allowed if mask is not None else None) if d[0] != f), 1):
+                score[g] += 1.0 / (RRF_K + rank)
+                dense_hit[g] = (text, ci)
+        # Keyword side: the file's words that are frequent in it but rare elsewhere.
+        stems = self._tokenize([self.texts[f]], ids=False)[0]
+        counts = Counter(t for t in stems if t in self.bm25.vocab_dict and len(t) > 2)
+        n_docs = int(self.keyword["alive"].sum()) or 1
+        weighted = []
+        for t, c in counts.most_common(200):
+            df = int((self.bm25.get_scores([t]) > 0).sum())
+            if 1 < df < 0.5 * n_docs:
+                weighted.append((c * np.log(n_docs / df), t))
+        terms = [t for _, t in sorted(weighted, reverse=True)[:MLT_TERMS]]
+        if terms:
+            kw_scores = self.bm25.get_scores(terms)
+            hits = np.flatnonzero((kw_scores > 0) & allowed)
+            for rank, g in enumerate(hits[np.argsort(-kw_scores[hits], kind="stable")].tolist(), 1):
+                score[g] += 0.5 / (RRF_K + rank)
+        score[~allowed] = 0
+        top = [int(g) for g in np.argsort(-score, kind="stable")[:k] if score[g] > 0]
+        best = float(score[top[0]]) if top else 1.0
+        out = []
+        for g in top:
+            text, ci = dense_hit.get(g) or (self._keyword_snippet(g, terms, None), None)
+            text = " ".join(text.split())
+            out.append({"path": self.manifest["paths"][g], "score": float(score[g]) / best,
+                        "snippet": text[:SNIPPET_CHARS], "passage": text[:PASSAGE_CHARS], "chunk_id": ci,
+                        **self._result_meta(g)})
+        return out
+
     def search(self, query: str, query_vec: np.ndarray | None, k: int = 5,
-               filters: Filters | None = None) -> list[dict[str, Any]]:
+               filters: Filters | None = None, meta: "QueryMeta | None" = None) -> list[dict[str, Any]]:
         """Top-k files. Score is scaled to 0-1, where 1 means a literal match plus top ranks from both searches."""
         if not self.ready():
             return []
         mask = self.filter_mask(filters)
         sig = self.signals(query, query_vec, mask)
         score = self.fuse(sig, len(self.manifest["paths"]))
-        if mask is not None:
-            score[~mask] = 0
+        score[~(self.keyword["alive"] if mask is None else mask)] = 0
+        if meta is not None and meta.active():
+            relevant = score > 0
+            types, dates = self._meta_masks(meta)
+            if types is not None:
+                score[relevant & types] += W_META_TYPE
+            if dates is not None:
+                score[relevant & dates] += W_META_DATE
+            if meta.recent:
+                # "Latest" means the newest version, so go by date modified (a download keeps the original's).
+                close = score >= 0.5 * score.max()
+                age_days = np.maximum(0.0, (time.time() - self.keyword["modified"]) / 86400.0)
+                score[close] += W_RECENT * np.exp(-age_days[close] / RECENT_DAYS)
         top = [int(f) for f in np.argsort(-score, kind="stable")[:k] if score[f] > 0]
         best_possible = W_NAME + (W_KW + W_DENSE) / (RRF_K + 1)
+        if meta is not None and meta.active():
+            best_possible += W_META_TYPE * bool(meta.types) + W_META_DATE * (meta.after is not None or meta.before is not None)
         dense_hit = {f: (text, ci) for f, text, ci in sig["dense"]}
         phrase = " ".join(_words(query))
         results = []

@@ -70,3 +70,26 @@ tr.passage-hit td{background:rgba(255,200,0,.28)}
 .menu-item:hover,.menu-item:focus-visible{background:var(--blue);color:#fff;outline:none}.menu-item:hover .menu-hint{color:#fffc}
 .menu-item img{width:18px;height:18px;flex:none}.menu-item.other{padding-left:35px}
 .menu-hint{color:var(--muted);font-size:12px}.menu-pad{padding:4px 8px}.menu-sep{height:1px;background:var(--border);margin:5px 4px}
+
+.folder-item{position:relative}.folder-item>span{flex:1;min-width:0}
+.folder-remove{display:grid;place-items:center;width:20px;height:20px;border:0;border-radius:5px;background:transparent;color:var(--muted);opacity:0;flex:none;padding:0}
+.folder-remove svg{width:12px!important;height:12px!important;color:var(--muted)!important}
+.folder-item:hover .folder-remove,.folder-remove:focus-visible{opacity:1}.folder-remove:hover{background:var(--border)}
+.sidebar-collapsed .folder-remove{display:none}
+
+.understood{display:flex;align-items:center;flex-wrap:wrap;gap:6px;margin:-18px 0 14px;font-size:12px;color:var(--muted)}
+.understood .chip{background:color-mix(in srgb,var(--blue) 12%,transparent);color:var(--blue);border-radius:10px;padding:2px 9px;font-weight:600;font-size:11px}
+.understood strong{color:var(--text)}.link-button{border:0;background:transparent;color:var(--blue);font-weight:600;font-size:12px;padding:0 4px}
+
+.workspace{position:relative}
+.top-progress{position:absolute;top:0;left:0;right:0;height:3px;background:color-mix(in srgb,var(--blue) 15%,transparent);overflow:hidden;z-index:2}
+.top-progress>div{height:100%;background:var(--blue);transition:width .8s ease}
+.top-progress.indeterminate>div{width:30%;animation:slide 1.2s ease-in-out infinite}
+@keyframes slide{0%{transform:translateX(-100%)}100%{transform:translateX(340%)}}
+.embed-progress{padding:8px 12px 10px;margin:0 2px 4px;border-radius:8px;background:var(--hover)}
+.embed-progress-label{display:flex;justify-content:space-between;font-size:11px;font-weight:600;color:var(--text);margin-bottom:6px}
+.progress-track{height:5px;border-radius:3px;background:color-mix(in srgb,var(--blue) 18%,transparent);overflow:hidden}
+.progress-fill{height:100%;border-radius:3px;background:var(--blue);transition:width .8s ease}
+.embed-progress-sub{font-size:10px;color:var(--muted);margin-top:6px;line-height:1.35}
+.sidebar-collapsed .embed-progress{display:none}
+@media (prefers-reduced-motion: reduce){.top-progress.indeterminate>div{animation:none;width:100%;opacity:.5}.top-progress>div,.progress-fill{transition:none}}
