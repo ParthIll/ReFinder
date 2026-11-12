@@ -48,12 +48,32 @@ persistence, API; Frontend owns setup/search/preview UX.
   `extract_text` joins pieces for callers that want one string.
 - `refinder/tree.py` — experimental semantic category tree over files (spherical k-means); `prune` (beam search)
   and `boost` (category-match bonus) search modes.
-- `evaluation/server.py` + `evaluation/database.py` — the FastAPI backend (Sanjay). `ChromaIndex` persists chunks
-  in `evaluation/chroma_db/` (cosine HNSW) plus a `manifest.json` holding every file's extracted text.
-  `/index` is synchronous and rebuilds the whole collection for one folder; no SQLite ledger, no incremental
-  rescan, no delete/rename handling. Search fetches `max(20k, 50)` chunks and keeps the best chunk per file.
-  Note: the API indexes with window `chunk()` and the default model, so it does not yet match what the benchmark
-  measures (paragraph chunking, chosen model, locations).
+- `evaluation/server.py` + `evaluation/database.py` — the FastAPI backend used by the Tauri app (`frontend/`).
+  Hybrid index: `/index` extracts in parallel, builds a BM25 index over full file text and returns (keyword search
+  works immediately), then a background thread embeds up to 20 paragraph chunks per file with bge-small fp16 into
+  Chroma (`evaluation/chroma_db/`). `/status` reports `extracting`/`embedding` progress; `/search` is literal-first:
+  filename match (share of query words, squared; fuzzy) + exact-phrase bonus + RRF(k=60) of BM25 (typo-corrected)
+  and dense (best chunk per file); score scaled to 0-1. `/search?mode=keyword` is plain BM25 with a "did you mean"
+  suggestion; filters (type, modified, macOS Date Added, size, folder) narrow both modes, and filters with no query
+  list matching files newest first. `/index` takes `mode=replace|add`: add reads and embeds only files not yet indexed
+  (doc ids are append-only, so existing vectors stay), then rebuilds BM25 over everything; `whole_computer` indexes
+  the home folder minus hidden/system/app/dependency folders (`custom.list_files`). `manifest.json` keeps roots,
+  absolute paths and extracted pieces so BM25 is rebuilt on restart; embedding resumes from `embedded_docs`.
+  `/preview`, `/raw`, `/thumbnail`, `/open` (evaluation/preview.py) serve the app's file viewer and open/reveal
+  actions, only for indexed paths; the frontend renders PDFs with pdf.js and DOCX with docx-preview (`Preview.tsx`),
+  PPTX as Quick Look HTML (macOS, `/quicklook/{key}/`), and highlights each result's `passage` by word overlap
+  (`highlight.ts`). Matches `custom.py --models
+  BAAI/bge-small-en-v1.5 --fp16 --max-chunks 20 --hybrid`; team corpus via the API: Hit@1 0.414 / Hit@5 0.755,
+  searchable in ~15 s, fully embedded in ~75 s.
+  Keeping current: `evaluation/watcher.py` (watchdog) reports changed paths; `server.reconcile` re-reads new/changed
+  files and drops deleted ones (a startup pass catches changes made while closed). Deleted or replaced files are
+  tombstoned (`manifest["deleted"]`, empty pieces, vectors removed) so doc ids never shift; `stamps` hold
+  (mtime, size) per file. `/folders/remove` drops one folder. Smart search reads type/date/recency hints from the
+  query (`evaluation/query_meta.py`) as small boosts (team 0.516->0.520 Hit@1, sample 0.870->0.878); `/similar` is
+  "More like this" (mean chunk vector + distinctive-word BM25).
+- Desktop launcher: `frontend/src-tauri/src/backend.rs` starts the backend with the app and stops it on quit (reuses
+  one already on :8000; dev runs `.venv` uvicorn; packaged builds run the PyInstaller backend from
+  `packaging/build_backend.sh`, index in the app data dir). `npm run build:app` builds both (~1.5 GB .app).
 - `evaluation/custom.py` — main benchmark: corpus folder + query CSV(s); auto-discovers the team's per-folder
   query CSVs (source_file/corpus_path, secondary_relevant_files, query_type, split). Dense vs BM25, Hit@1/5/10,
   Recall@10, MRR@10, graded nDCG@10, breakdowns by folder/category/file type, latency, `--chunking`, `--tree-*`.

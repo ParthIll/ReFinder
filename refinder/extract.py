@@ -70,6 +70,7 @@ class UnsupportedFile(Exception):
 class Piece:
     text: str
     location: dict  # always has "piece" (1-based order in the file); plus page/paragraph/slide/row/table/sheet/range
+    visual: dict | None = None  # OCR fallback asset; kept separate from the text sent to the language model
 
 
 def _ints(**groups: str | None) -> dict:
@@ -79,11 +80,12 @@ def _ints(**groups: str | None) -> dict:
 # Label formats per file type, as written by refinder-extractors. Only applied to the matching suffixes so a
 # .txt paragraph that happens to start with "Row 5:" isn't misread.
 LABELS: dict[str, tuple[re.Pattern, Callable[[re.Match], dict]]] = {
-    ".pdf": (re.compile(r"^Page (\d+)(?: Paragraph (\d+))?\n"), lambda m: _ints(page=m[1], paragraph=m[2])),
+    ".pdf": (re.compile(r"^Page (\d+)(?: Paragraph (\d+)| Image (\d+))?\n"),
+             lambda m: _ints(page=m[1], paragraph=m[2], image=m[3])),
     ".pptx": (re.compile(r"^Slide (\d+)\n"), lambda m: _ints(slide=m[1])),
     ".csv": (re.compile(r"^Row (\d+): "), lambda m: _ints(row=m[1])),
     ".tsv": (re.compile(r"^Row (\d+): "), lambda m: _ints(row=m[1])),
-    ".docx": (re.compile(r"^Table (\d+):\n"), lambda m: _ints(table=m[1])),
+    ".docx": (re.compile(r"^(?:Table (\d+)|Image (\d+)):\n"), lambda m: _ints(table=m[1], image=m[2])),
     # Keep the sheet name in the text (it's often meaningful, e.g. "Budget 2026"); drop only the cell range.
     ".xlsx": (re.compile(r"^(Sheet: .*?); Range: ([A-Z]+\d+:[A-Z]+\d+)\n"), lambda m: {"sheet": m[1][7:], "range": m[2]}),
 }
@@ -104,12 +106,34 @@ def extract_pieces(path: Path) -> list[Piece]:
     if suffix not in SUPPORTED_SUFFIXES or path.name.startswith(("~$", ".")):
         raise UnsupportedFile(f"skipped type {suffix or path.name}")
     pieces = []
-    raw_pieces = LOCAL_EXTRACTORS[suffix](path) if suffix in LOCAL_EXTRACTORS else extract(path)
+    visuals = []
+    from refinder.vision import VISUAL_SUFFIXES, capture_asset
+
+    def on_visual(image, location, info):
+        visuals.append(capture_asset(image, location, info))
+
+    if suffix == ".pdf":
+        from refinder_extractors.extractors.pdf import extract_pdf
+        raw_pieces = extract_pdf(path, on_visual=on_visual)
+    elif suffix == ".docx":
+        from refinder_extractors.extractors.word import extract_docx
+        raw_pieces = extract_docx(path, on_visual=on_visual)
+    elif suffix in VISUAL_SUFFIXES:
+        from refinder_extractors.extractors.ocr import extract_image
+        raw_pieces = extract_image(path, on_visual=on_visual)
+    else:
+        raw_pieces = LOCAL_EXTRACTORS[suffix](path) if suffix in LOCAL_EXTRACTORS else extract(path)
     for i, raw in enumerate(raw_pieces, 1):
         text, location = _strip_label(raw, suffix)
         if text.strip():
             pieces.append(Piece(text, {"piece": i, **location}))
+    for asset in visuals:
+        pieces.append(Piece("", {"piece": len(pieces) + 1, **{k: asset[k] for k in ("page", "image") if k in asset}}, asset))
     return pieces
+
+
+def visual_assets(pieces: list[Piece]) -> list[dict]:
+    return [p.visual for p in pieces if getattr(p, "visual", None) is not None]
 
 
 def pieces_from_text(text: str) -> list[Piece]:
