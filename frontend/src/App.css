@@ -70,3 +70,4 @@ tr.passage-hit td{background:rgba(255,200,0,.28)}
 .menu-item:hover,.menu-item:focus-visible{background:var(--blue);color:#fff;outline:none}.menu-item:hover .menu-hint{color:#fffc}
 .menu-item img{width:18px;height:18px;flex:none}.menu-item.other{padding-left:35px}
 .menu-hint{color:var(--muted);font-size:12px}.menu-pad{padding:4px 8px}.menu-sep{height:1px;background:var(--border);margin:5px 4px}
+.model-setting{margin-top:20px}.settings .model-description{margin-top:8px;font-size:12px}

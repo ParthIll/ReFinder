@@ -18,6 +18,7 @@ import numpy as np
 
 from refinder.embedder import CHUNK_OVERLAP, CHUNK_TOKENS, Embedder
 from refinder.extract import Piece, UnsupportedFile, describe_location, extract_pieces
+from refinder.models import sample_chunks
 
 # Giant files (textbooks, big spreadsheets) keep this many evenly spaced chunks. On the team corpus this embeds 22% of
 # the chunks with no accuracy loss on any test set (Harrier 270M, full pipeline; 50 also passed, 200 saved less).
@@ -46,9 +47,7 @@ class IndexedFile:
 
 def keep_evenly(n: int, cap: int | None) -> np.ndarray:
     """Which of n chunks to embed: all of them, or `cap` evenly spaced ones (first and last included)."""
-    if cap is None or n <= cap:
-        return np.arange(n)
-    return np.unique(np.linspace(0, n - 1, cap).round().astype(int))
+    return np.array(sample_chunks(n, cap or 0, "even"), dtype=int)
 
 
 def chunk_file(path: Path, embedder: Embedder, overlap: int, cap: int | None) -> IndexedFile:

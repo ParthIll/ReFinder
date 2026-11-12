@@ -127,3 +127,36 @@ On the Mac GPU the full 26,298 chunks take about 3.5 min with Harrier 270M and 9
 - Parth's ~90 min with Qwen on a GPU isn't explained by this Mac (about 10 min). Running
   `python -m evaluation.index_bench --models Qwen/Qwen3-Embedding-0.6B --limit-chunks 2000` on his machine will show
   which stage is slow.
+
+# Models inside the app's search (Nov 12, 2026)
+
+`python -m evaluation.api_eval` runs each model in `refinder/models.py` through `evaluation/database.py` exactly as
+the app does: BM25 + filename/folder bonus + exact-phrase bonus + meaning ranking, fused by rank, with each model's
+own chunk budget, and the whole-file vector + gte reranker for the Harrier models. Exact-duplicate files count as
+hits, as in `evaluation.custom` (the app ranks two identical copies one after the other). Mac GPU (MPS).
+
+| Model (chunks per file) | Team Hit@1 / @5 | OrgSmith | Sample | Team embedding | Search p50 |
+|---|---|---|---|---|---|
+| bge-small (20, head) | 0.552 / 0.776 | 0.609 / 0.926 | 0.878 / 0.974 | 7 s | 17 ms |
+| MiniLM (20, head) | 0.555 / 0.776 | 0.630 / 0.936 | 0.887 / 0.974 | 17 s | 25 ms |
+| **Harrier 270M (100, even) + file vector + reranker** | **0.600 / 0.788** | 0.623 / 0.928 | 0.870 / 0.974 | 54 s | 406 ms |
+| Harrier 0.6B (100, even) + file vector + reranker | 0.614 / 0.808 | 0.625 / 0.931 | 0.887 / 0.974 | 117 s | 423 ms |
+
+## What the app's fusion does to each model (same indexes, only the weights changed)
+| Change to the fusion | bge-small team / OrgSmith / sample | Harrier 270M | Harrier 0.6B |
+|---|---|---|---|
+| as shipped (name 0.05, phrase 0.03, BM25 1, meaning 1) | 0.552 / 0.609 / 0.878 | 0.600 / 0.623 / 0.870 | 0.614 / 0.625 / 0.887 |
+| no filename/folder bonus | 0.509 / 0.783 / 0.852 | 0.577 / 0.816 / 0.843 | 0.586 / 0.833 / 0.861 |
+| meaning ranking only | 0.491 / 0.754 / 0.878 | 0.614 / 0.785 / 0.904 | 0.664 / 0.816 / 0.939 |
+| BM25 weight 0.25 | 0.567 / 0.613 / 0.887 | 0.635 / 0.621 / 0.861 | 0.645 / 0.616 / 0.896 |
+| BM25 only | 0.405 / 0.776 / 0.783 | | |
+
+- The filename/folder bonus costs OrgSmith 16–21 points for every model (its questions share words with folder
+  names, so whole folders get the same boost) and gains the team corpus 2–4 points. Parth tuned it on filename
+  and exact-phrase queries, which these test sets don't have, so it may still be right for real users: needs a
+  team decision, not changed here.
+- Harrier's own meaning ranking is the best single signal on the team corpus and sample; mixed with BM25 at equal
+  weight it loses 1–5 points there. A per-model fusion weight (in `ModelSpec`) would let Harrier keep it.
+- The app's Harrier meaning ranking (0.614 / 0.785 / 0.904) is below the benchmark's (0.648 / 0.823 / 0.957):
+  the app scores only files near the top 400 chunks and 100 file vectors, while the benchmark scores every file.
+- Search: the Harrier reranker adds ~0.4 s per query on the Mac GPU; CPU not measured yet.

@@ -35,7 +35,8 @@ persistence, API; Frontend owns setup/search/preview UX.
 
 ## What exists in this repo
 
-`andrew` = `main` (Sanjay's FastAPI + Chroma backend) merged with `testing-environment` (Parth's ML/eval work).
+Branches: `testing-environment` = Parth's desktop app (Sanjay's Tauri frontend + hybrid backend); `andrew` = the
+ML/benchmark work (ONNX, indexing speed); `andrew-model-picker` = `testing-environment` + `andrew` + the model picker.
 
 - `refinder/embedder.py` — `Embedder` wraps Sentence Transformers; `encode` (documents) / `encode_queries`
   (queries), L2-normalized float32 so dot product == cosine. Two chunkers: `chunk` (fixed 200-token windows,
@@ -45,6 +46,10 @@ persistence, API; Frontend owns setup/search/preview UX.
   is `BAAI/bge-small-en-v1.5` (384-d). On CPU, models load in float32, and `ONNX_MODELS` (Harrier 270M, bge-small,
   MiniLM) run through `refinder/onnx_encoder.py`, which exports to `.cache/onnx/` on first use, reproduces the
   model's pooling (last-token, CLS or mean) and falls back to PyTorch on failure. `MAX_BATCH = 32` (bigger was slower).
+- `refinder/models.py` — registry of the embedding models the app offers (`MODELS`, keyed `bge-small`, `harrier-270m`,
+  `harrier-0.6b`, `minilm`). Each `ModelSpec` carries its chunk budget per file (`max_chunks` + `sampling`
+  head/even), `fp16` (off for Harrier: NaN in fp16), and whether search adds the whole-file vector and a reranker.
+  `sample_chunks` is the one chunk sampler. To add a model, add a spec (and its prompts in `MODEL_PROMPTS`).
 - `refinder/indexer.py` — the ML half of indexing, no storage: `index_files(paths, embedder)` yields per file its
   chunks (text, ordinal, location), vectors, whole-file vector and full chunk count, smallest files first, batching
   across files and embedding repeated texts once. Giant files keep `MAX_CHUNKS_PER_FILE = 100` evenly spaced chunks.
@@ -56,7 +61,8 @@ persistence, API; Frontend owns setup/search/preview UX.
   and `boost` (category-match bonus) search modes.
 - `evaluation/server.py` + `evaluation/database.py` — the FastAPI backend used by the Tauri app (`frontend/`).
   Hybrid index: `/index` extracts in parallel, builds a BM25 index over full file text and returns (keyword search
-  works immediately), then a background thread embeds up to 20 paragraph chunks per file with bge-small fp16 into
+  works immediately), then a background thread embeds each file's chunks, capped per the index's model spec
+  (`refinder/models.py`; default bge-small fp16, 20 per file), into
   Chroma (`evaluation/chroma_db/`). `/status` reports `extracting`/`embedding` progress; `/search` is literal-first:
   filename match (share of query words, squared; fuzzy) + exact-phrase bonus + RRF(k=60) of BM25 (typo-corrected)
   and dense (best chunk per file); score scaled to 0-1. `/search?mode=keyword` is plain BM25 with a "did you mean"
@@ -65,6 +71,14 @@ persistence, API; Frontend owns setup/search/preview UX.
   (doc ids are append-only, so existing vectors stay), then rebuilds BM25 over everything; `whole_computer` indexes
   the home folder minus hidden/system/app/dependency folders (`custom.list_files`). `manifest.json` keeps roots,
   absolute paths and extracted pieces so BM25 is rebuilt on restart; embedding resumes from `embedded_docs`.
+  Models: `GET /models` lists the registry; `/index` takes `model` (replace only; add keeps the index's model);
+  `POST /model` switches an index's model, keeping text + BM25 and redoing only vectors. Specs with `file_vector`
+  store one mean vector per file in the `refinder_files` Chroma collection and replace the dense ranking with best
+  chunk + file vector - size penalty, then the gte reranker on the top 30 chunks, fused by rank
+  (`_dense_ranking_plus`); other models use Parth's dense ranking unchanged. The Settings dialog has the picker.
+  `python -m evaluation.api_eval` scores every model through this real search code (ITERATIONS.md, "Models inside
+  the app's search": Harrier 270M team 0.600 vs bge-small 0.552 Hit@1; the filename/folder bonus costs OrgSmith
+  ~18 pts for every model; duplicates count as hits).
   `/preview`, `/raw`, `/thumbnail`, `/open` (evaluation/preview.py) serve the app's file viewer and open/reveal
   actions, only for indexed paths; the frontend renders PDFs with pdf.js and DOCX with docx-preview (`Preview.tsx`),
   PPTX as Quick Look HTML (macOS, `/quicklook/{key}/`), and highlights each result's `passage` by word overlap

@@ -16,6 +16,10 @@ questions plus generated filename / filename-with-typo / exact-phrase queries.
 
 This is the setup that indexed fastest at equal or better accuracy in the benchmark (evaluation/custom.py with
 --max-chunks 20 --hybrid): ~15x less embedding than embedding every chunk.
+
+The embedding model is chosen per index (refinder/models.py). Each model brings its own chunk budget, and models
+with `file_vector` / `reranker` set (Harrier) replace the plain best-chunk ranking above with their own meaning
+ranking: best chunk + whole-file vector - giant-file penalty, then a cross-encoder over the top chunks, fused by rank.
 """
 
 from __future__ import annotations
@@ -39,6 +43,8 @@ import Stemmer
 from bm25s.stopwords import STOPWORDS_EN
 from chromadb.config import Settings
 from rapidfuzz import fuzz, process
+
+from refinder import models
 
 if TYPE_CHECKING:
     from refinder.embedder import Embedder
@@ -106,10 +112,12 @@ class Filters:
         return any(v not in (None, "", set()) for v in vars(self).values())
 
 COLLECTION_NAME = "refinder"
+FILES_COLLECTION = "refinder_files"  # one whole-file mean vector per file, for models with file_vector
 DEFAULT_PERSIST_DIR = Path(__file__).resolve().parent / "chroma_db"
 MANIFEST_NAME = "manifest.json"
 EMBED_BATCH = 256  # chunks per encode + Chroma add; also how often embedding checks for cancellation
-MAX_CHUNKS_PER_FILE = 20  # long files: first 10 chunks + 10 spread over the rest; BM25 still sees the full text
+# Chunks embedded per file come from the model's spec (refinder/models.py; bge-small: first 10 + 10 spread over the
+# rest). BM25 always sees the full text.
 RRF_K = 60  # reciprocal rank fusion constant; a file scores sum(1 / (RRF_K + rank)) over the lists it appears in
 DENSE_CANDIDATES = 400  # nearest chunks fetched from Chroma per query
 SNIPPET_CHARS = 300
@@ -127,6 +135,12 @@ SHORT_QUERY_WORDS = 3  # queries this short are usually name lookups: their file
 FUZZY_MIN_LEN = 4  # shorter words only match exactly ("tax" must not fuzzy-match "tex")
 FUZZY_CUTOFF = 85  # rapidfuzz ratio, 0-100
 PHRASE_CANDIDATES = 300  # files (by BM25) checked for an exact phrase
+# Meaning ranking for models with file_vector / reranker (evaluation/ITERATIONS.md: best Harrier setup).
+W_FILE_VECTOR = 1.0  # weight of cos(query, file's mean chunk vector), added to its best chunk's cosine
+SIZE_RATIO = 10  # files with more than this x the median chunk count count as giant ...
+SIZE_PENALTY = 0.02  # ... and lose this x log(how far over) from their score
+FILE_CANDIDATES = 100  # files fetched by whole-file vector, besides those of the nearest chunks
+RERANK_DEPTH = 30  # nearest chunks the cross-encoder re-scores
 _WORD = re.compile(r"[a-z0-9]+")
 _STOP = set(STOPWORDS_EN)
 
@@ -144,6 +158,17 @@ def _name_words(path: str) -> tuple[list[str], list[str]]:
     return both(p.stem), [w for part in p.parent.parts for w in both(part)]
 
 
+def _tied_ranks(order: list[int], score: dict[int, float]) -> dict[int, int]:
+    """1-based rank of each id in `order` (sorted best first); equal scores share the best rank, so exact duplicate
+    files stay tied after rank fusion."""
+    ranks, prev, rank = {}, None, 0
+    for i, d in enumerate(order, 1):
+        if score[d] != prev:
+            rank, prev = i, score[d]
+        ranks[d] = rank
+    return ranks
+
+
 class Cancelled(Exception):
     """A newer index replaced the one being embedded."""
 
@@ -159,6 +184,11 @@ class ChromaIndex:
         )
         self.collection = self.client.get_or_create_collection(
             name=COLLECTION_NAME, embedding_function=None, metadata={"hnsw:space": "cosine"})
+        self.files = self.client.get_or_create_collection(
+            name=FILES_COLLECTION, embedding_function=None, metadata={"hnsw:space": "cosine"})
+        self._median_chunks: tuple[int, float] = (-1, 1.0)  # (files counted, median chunks per file)
+        self._rerankers: dict[str, Any] = {}
+        self.rerank_lock = threading.Lock()
         self.stemmer = Stemmer.Stemmer("english")
         self.lock = threading.Lock()  # guards swapping the index; searches read a consistent snapshot
         self.generation = 0  # bumped by every build_keyword, so a stale background embed can stop
@@ -180,6 +210,16 @@ class ChromaIndex:
 
     def model_name(self) -> str | None:
         return self.manifest.get("model_name") if self.manifest else None
+
+    def model_key(self) -> str | None:
+        """Registry key of the index's model (older manifests stored only the Hugging Face id)."""
+        if not self.manifest:
+            return None
+        spec = models.MODELS.get(self.manifest.get("model_key")) or models.by_name(self.manifest.get("model_name"))
+        return spec.key if spec else None
+
+    def spec(self) -> models.ModelSpec:
+        return models.get(self.model_key())
 
     def embedding_complete(self) -> bool:
         return bool(self.manifest and self.embedded_docs >= len(self.manifest["paths"]))
@@ -246,22 +286,40 @@ class ChromaIndex:
         with self.lock:
             self.manifest, self.texts, self.bm25, self.keyword = manifest, texts, bm25, keyword
 
-    def replace(self, root: Path, paths: list[str], pieces: list[list[str]], model_name: str) -> int:
-        """Stage 1: replace the whole index with a keyword-only one over these files (absolute paths) from one
-        folder. Returns the new generation."""
-        with self.lock:
-            self.generation += 1
-            generation = self.generation
+    def _reset_vectors(self, spec: models.ModelSpec) -> int:
+        """Drop every vector (chunks and whole-file) and stop any running embed. Call with self.lock held."""
+        self.generation += 1
+        for name in (COLLECTION_NAME, FILES_COLLECTION):
             try:
-                self.client.delete_collection(COLLECTION_NAME)
+                self.client.delete_collection(name)
             except Exception:
                 pass
-            self.collection = self.client.get_or_create_collection(
-                name=COLLECTION_NAME, embedding_function=None,
-                metadata={"hnsw:space": "cosine", "model_name": model_name})
-            self.embedded_chunks = self.total_chunks = self.embedded_docs = 0
-        self._set_keyword({"roots": [str(root)], "root_of": [0] * len(paths), "model_name": model_name,
-                           "paths": paths, "pieces": pieces})
+        meta = {"hnsw:space": "cosine", "model_name": spec.name}
+        self.collection = self.client.get_or_create_collection(name=COLLECTION_NAME, embedding_function=None,
+                                                               metadata=meta)
+        self.files = self.client.get_or_create_collection(name=FILES_COLLECTION, embedding_function=None,
+                                                          metadata=meta)
+        self.embedded_chunks = self.total_chunks = self.embedded_docs = 0
+        return self.generation
+
+    def replace(self, root: Path, paths: list[str], pieces: list[list[str]], model_key: str) -> int:
+        """Stage 1: replace the whole index with a keyword-only one over these files (absolute paths) from one
+        folder, to be embedded with model `model_key`. Returns the new generation."""
+        spec = models.get(model_key)
+        with self.lock:
+            generation = self._reset_vectors(spec)
+        self._set_keyword({"roots": [str(root)], "root_of": [0] * len(paths), "model_name": spec.name,
+                           "model_key": spec.key, "paths": paths, "pieces": pieces})
+        self._write_manifest()
+        return generation
+
+    def set_model(self, model_key: str) -> int:
+        """Switch the index to another embedding model: keyword search and extracted text stay, every vector is
+        dropped so `embed` redoes them with the new model. Returns the new generation."""
+        spec = models.get(model_key)
+        with self.lock:
+            generation = self._reset_vectors(spec)
+            self.manifest = {**self.manifest, "model_name": spec.name, "model_key": spec.key}
         self._write_manifest()
         return generation
 
@@ -295,14 +353,23 @@ class ChromaIndex:
         Raises Cancelled if the index changed meanwhile. `model_lock` serializes model use with query encoding."""
         from evaluation.common import chunk_corpus
 
+        spec = self.spec()
         first = self.embedded_docs
         with self.lock:  # drop chunks of a file that was half done when a previous embed stopped
             self.collection.delete(where={"doc_id": {"$gte": first}})
+            self.files.delete(where={"doc_id": {"$gte": first}})
             done_chunks = self.count()
         pieces = self.manifest["pieces"][first:]
         texts = self.texts[first:]
-        chunk_texts, owner, _ = chunk_corpus(embedder, texts, pieces, "paragraph", max_chunks=MAX_CHUNKS_PER_FILE)
-        owner = np.asarray(owner, dtype=int) + first
+        chunk_texts, owner, _ = chunk_corpus(embedder, texts, pieces, "paragraph")
+        owner = np.asarray(owner, dtype=int)
+        n_full = np.bincount(owner, minlength=len(texts))  # each file's real chunk count, for the size penalty
+        starts = np.r_[0, np.cumsum(n_full)[:-1]]
+        keep = [int(s) + i for s, n in zip(starts, n_full) for i in models.sample_chunks(int(n), spec.max_chunks,
+                                                                                          spec.sampling)]
+        chunk_texts, owner = [chunk_texts[i] for i in keep], owner[keep] + first
+        n_full = {first + d: int(n) for d, n in enumerate(n_full)}
+        sums: dict[int, np.ndarray] = {}  # running sum of each file's chunk vectors (file_vector models)
         ordinal = np.zeros(len(owner), dtype=int)  # chunk position within its file (after capping)
         for i in range(1, len(owner)):
             ordinal[i] = ordinal[i - 1] + 1 if owner[i] == owner[i - 1] else 0
@@ -316,9 +383,14 @@ class ChromaIndex:
             with model_lock:
                 vecs = embedder.encode(batch, batch_size=64)
             end = start + len(batch)
+            if spec.file_vector:
+                for i, v in zip(owner[start:end], vecs):
+                    sums[int(i)] = sums[int(i)] + v if int(i) in sums else v.astype(np.float64)
             with self.lock:
                 if generation != self.generation:
                     raise Cancelled
+                if spec.file_vector:  # files whose last chunk is in this batch are complete
+                    self._add_file_vectors(sums, n_full, below=int(owner[end]) if end < len(owner) else n_docs)
                 self.collection.add(
                     ids=[f"{owner[i]}:{ordinal[i]}" for i in range(start, end)],
                     embeddings=vecs,
@@ -336,6 +408,16 @@ class ChromaIndex:
                 raise Cancelled
             self.embedded_docs = n_docs
             self._write_manifest()
+
+    def _add_file_vectors(self, sums: dict[int, np.ndarray], n_full: dict[int, int], below: int) -> None:
+        """Store the normalized mean vector of every finished file (doc id < below) and forget its running sum."""
+        done = sorted(d for d in sums if d < below)
+        if not done:
+            return
+        vecs = np.stack([sums.pop(d) for d in done])
+        vecs /= np.maximum(np.linalg.norm(vecs, axis=1, keepdims=True), 1e-12)
+        self.files.add(ids=[str(d) for d in done], embeddings=vecs.astype(np.float32),
+                       metadatas=[{"doc_id": d, "n_chunks": n_full[d]} for d in done])
 
     def file_text(self, path: str) -> str | None:
         try:
@@ -430,10 +512,13 @@ class ChromaIndex:
         flat = self.keyword["flat"]
         return {f for f in candidates if all(p in flat[f] for p in phrases)}
 
-    def _dense_ranking(self, query_vec: np.ndarray | None,
-                       allowed: np.ndarray | None = None) -> list[tuple[int, str, int]]:
+    def _dense_ranking(self, query_vec: np.ndarray | None, allowed: np.ndarray | None = None,
+                       query: str = "") -> list[tuple[int, str, int]]:
         """(doc_id, chunk text, chunk index) of each file's best chunk, best file first. With `allowed` (a file
         mask), only those files' chunks are searched, so a narrow filter still gets meaning-based matches."""
+        spec = self.spec()
+        if spec.file_vector or spec.reranker:
+            return self._dense_ranking_plus(spec, query, query_vec, allowed)
         n = self.count()
         if query_vec is None or n == 0:
             return []
@@ -453,6 +538,68 @@ class ChromaIndex:
                 best.append((int(meta["doc_id"]), doc or "", int(meta["chunk_index"])))
         return best
 
+    def _dense_ranking_plus(self, spec: models.ModelSpec, query: str, query_vec: np.ndarray | None,
+                            allowed: np.ndarray | None) -> list[tuple[int, str, int]]:
+        """Meaning ranking for models with file_vector / reranker. Files found only by their whole-file vector come
+        back with empty chunk text (search then shows a keyword snippet for them)."""
+        n = self.count()
+        if query_vec is None or n == 0:
+            return []
+        q = np.asarray(query_vec, dtype=np.float32)
+        where = None
+        if allowed is not None:
+            ids = np.flatnonzero(allowed).tolist()
+            if not ids:
+                return []
+            where = {"doc_id": {"$in": ids}}
+        raw = self.collection.query(query_embeddings=[q], n_results=min(n, DENSE_CANDIDATES), where=where,
+                                    include=["documents", "metadatas", "distances"])
+        nearest = [(int(m["doc_id"]), d or "", int(m["chunk_index"]), 1.0 - float(dist))
+                   for d, m, dist in zip(raw["documents"][0], raw["metadatas"][0], raw["distances"][0]) if m]
+        best: dict[int, tuple[str, int, float]] = {}
+        for doc, text, ci, sim in nearest:  # sorted by distance, so the first chunk seen is the file's best
+            best.setdefault(doc, (text, ci, sim))
+        score = {doc: sim for doc, (_, _, sim) in best.items()}
+        if spec.file_vector and self.files.count():
+            floor = min(score.values()) if score else 0.0  # best-chunk score for files whose chunks weren't fetched
+            near_files = self.files.query(query_embeddings=[q], n_results=min(self.files.count(), FILE_CANDIDATES),
+                                          where=where, include=["metadatas"])
+            cand = set(best) | {int(m["doc_id"]) for m in near_files["metadatas"][0] if m}
+            got = self.files.get(ids=[str(d) for d in cand], include=["embeddings", "metadatas"])
+            median = self._median_chunk_count()
+            for emb, meta in zip(got["embeddings"], got["metadatas"]):
+                doc = int(meta["doc_id"])
+                excess = max(np.log(meta["n_chunks"] / (SIZE_RATIO * median)), 0.0)
+                score[doc] = score.get(doc, floor) + W_FILE_VECTOR * float(np.dot(q, emb)) - SIZE_PENALTY * excess
+        order = sorted(score, key=lambda d: -score[d])
+        if spec.reranker and query and nearest:
+            top = nearest[:RERANK_DEPTH]
+            with self.rerank_lock:
+                if spec.reranker not in self._rerankers:
+                    from sentence_transformers import CrossEncoder
+
+                    from refinder.embedder import pick_device
+
+                    self._rerankers[spec.reranker] = CrossEncoder(spec.reranker, device=pick_device())
+                ce = self._rerankers[spec.reranker].predict([(query, text) for _, text, _, _ in top],
+                                                            show_progress_bar=False)
+            ce_best: dict[int, float] = {}
+            for (doc, _, _, _), s in zip(top, np.asarray(ce, dtype=float)):
+                ce_best[doc] = max(ce_best.get(doc, -np.inf), s)
+            fused = {d: 1.0 / (RRF_K + r) for d, r in _tied_ranks(order, score).items()}
+            for d, r in _tied_ranks(sorted(ce_best, key=lambda d: -ce_best[d]), ce_best).items():
+                fused[d] += 1.0 / (RRF_K + r)
+            order = sorted(fused, key=lambda d: -fused[d])
+        return [(d, best[d][0], best[d][1]) if d in best else (d, "", -1) for d in order]
+
+    def _median_chunk_count(self) -> float:
+        """Median real chunk count per file, over files with a whole-file vector (cached until that count changes)."""
+        n = self.files.count()
+        if self._median_chunks[0] != n:
+            counts = [m["n_chunks"] for m in self.files.get(include=["metadatas"])["metadatas"]]
+            self._median_chunks = (n, float(np.median(counts)) if counts else 1.0)
+        return max(self._median_chunks[1], 1.0)
+
     def signals(self, query: str, query_vec: np.ndarray | None, allowed: np.ndarray | None = None) -> dict[str, Any]:
         """Everything ranking needs for one query (split out so evaluation can try other weights)."""
         words = [w for w in _words(query) if w not in _STOP]
@@ -463,7 +610,7 @@ class ChromaIndex:
             "tokens": tokens,
             "name": self._name_scores(words),
             "phrase": self._phrase_hits(query, keyword[:PHRASE_CANDIDATES]),
-            "dense": self._dense_ranking(query_vec, allowed),
+            "dense": self._dense_ranking(query_vec, allowed, query),
         }
 
     @staticmethod
@@ -559,7 +706,7 @@ class ChromaIndex:
             score[~mask] = 0
         top = [int(f) for f in np.argsort(-score, kind="stable")[:k] if score[f] > 0]
         best_possible = W_NAME + (W_KW + W_DENSE) / (RRF_K + 1)
-        dense_hit = {f: (text, ci) for f, text, ci in sig["dense"]}
+        dense_hit = {f: (text, ci) for f, text, ci in sig["dense"] if text}
         phrase = " ".join(_words(query))
         results = []
         for f in top:

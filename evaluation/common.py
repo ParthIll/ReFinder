@@ -48,9 +48,9 @@ def chunk_corpus(
 def sample_chunks(n: int, cap: int) -> list[int]:
     """Which of a file's n chunks to embed when only `cap` fit: the opening half of the budget (titles,
     abstracts, intros say what a file is about), then the rest spread evenly over the remainder."""
-    head = cap // 2
-    tail = np.linspace(head, n - 1, cap - head).round().astype(int)
-    return sorted(set(range(head)) | set(tail.tolist()))
+    from refinder.models import sample_chunks as sample
+
+    return sample(n, cap, "head")
 
 
 def embed_corpus(

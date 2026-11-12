@@ -1,8 +1,9 @@
 """ReFinder local API (FastAPI). Run: uvicorn evaluation.server:app --host 127.0.0.1 --port 8000
 
 Indexing a folder:  extract text (parallel processes) -> BM25 keyword index (searchable now) -> background thread
-embeds a capped sample of paragraph chunks per file with bge-small into Chroma. Search fuses BM25 and vector
-rankings (see evaluation/database.py), so results improve while embedding runs.
+embeds a capped sample of paragraph chunks per file into Chroma, with the model picked in the app
+(refinder/models.py; bge-small by default). Search fuses BM25 and vector rankings (see evaluation/database.py), so
+results improve while embedding runs. POST /model switches an index to another model without re-reading files.
 """
 
 import os
@@ -17,9 +18,8 @@ from fastapi.responses import FileResponse as RawFileResponse
 from pydantic import BaseModel
 
 from evaluation.database import Cancelled, ChromaIndex, Filters
+from refinder import models
 
-# Fastest model at good accuracy in the benchmark; fp16 is ~1.3x faster on GPU/MPS with the same results.
-MODEL_NAME = "BAAI/bge-small-en-v1.5"
 # Process start-up costs a few seconds, so small folders extract in-process.
 PARALLEL_MIN_FILES = 200
 
@@ -36,6 +36,9 @@ class IndexRequest(BaseModel):
     # "replace": the index becomes this folder only. "add": index this folder's new files alongside the folders
     # already indexed, without re-reading or re-embedding those.
     mode: str = "replace"
+    # Embedding model key from GET /models, for "replace" (default: the current index's model, else bge-small).
+    # "add" always keeps the index's model, so one index never mixes two models' vectors.
+    model: str | None = None
 
 
 class IndexResponse(BaseModel):
@@ -81,6 +84,26 @@ class StatusResponse(BaseModel):
     whole_computer: bool = False
     # Indexed files per type, e.g. {"pdf": 312, "docx": 80}, for the type filter.
     file_types: dict[str, int] = {}
+    # Key of the index's embedding model (see GET /models).
+    model: str | None = None
+
+
+class ModelInfo(BaseModel):
+    key: str
+    label: str
+    description: str
+    gpu_recommended: bool
+
+
+class ModelsResponse(BaseModel):
+    models: list[ModelInfo]
+    # The index's model, or the default when nothing is indexed yet.
+    active: str
+    default: str
+
+
+class ModelRequest(BaseModel):
+    model: str
 
 
 class FileResponse(BaseModel):
@@ -119,14 +142,23 @@ index_error: str | None = None
 
 
 def _get_embedder():
-    """Load the sentence-transformer on first use (a few seconds)."""
+    """The index's sentence-transformer, loaded on first use and reloaded when the index's model changes."""
     global embedder
     with model_lock:
-        if embedder is None:
+        spec = store.spec()
+        if embedder is None or embedder.model_name != spec.name:
             from refinder.embedder import Embedder
 
-            embedder = Embedder(store.model_name() or MODEL_NAME, fp16=True)
+            embedder = None  # free the old model before loading the next
+            # fp16 only applies on a GPU; on CPU the embedder uses float32 / ONNX instead.
+            embedder = Embedder(spec.name, fp16=spec.fp16)
     return embedder
+
+
+def _model_key(key: str | None) -> str:
+    if key is not None and key not in models.MODELS:
+        raise HTTPException(status_code=422, detail=f"Unknown model {key!r}; see GET /models")
+    return key or store.model_key() or models.DEFAULT_MODEL
 
 
 def _embed_in_background(generation: int) -> None:
@@ -167,9 +199,11 @@ _restore_from_disk()
 def index_folder(request: IndexRequest) -> IndexResponse:
     """Index a folder, replacing the current index or adding to it. Returns once keyword search is ready; embedding
     continues in the background (poll /status)."""
-    global index_state, index_error, embedder
+    global index_state, index_error
 
     from evaluation.custom import list_files, load_corpus
+
+    model_key = _model_key(request.model)
 
     folder = Path.home() if request.whole_computer else Path(request.folder).expanduser().resolve()
     if not folder.is_dir():
@@ -198,9 +232,7 @@ def index_folder(request: IndexRequest) -> IndexResponse:
         if adding:
             store.add(folder, abs_paths, piece_texts)
         else:
-            if embedder is not None and embedder.model_name != MODEL_NAME:
-                embedder = None  # index built with an older model: switch to the current one
-            store.replace(folder, abs_paths, piece_texts, MODEL_NAME)
+            store.replace(folder, abs_paths, piece_texts, model_key)
         _start_embedding()
     except HTTPException:
         raise
@@ -268,7 +300,36 @@ def status() -> StatusResponse:
         folders=roots,
         whole_computer=str(Path.home()) in roots,
         file_types=store.file_types(),
+        model=store.model_key(),
     )
+
+
+@app.get("/models", response_model=ModelsResponse)
+def list_models() -> ModelsResponse:
+    """The embedding models the app offers (refinder/models.py), and the one the index uses."""
+    return ModelsResponse(
+        models=[ModelInfo(key=m.key, label=m.label, description=m.description, gpu_recommended=m.gpu_recommended)
+                for m in models.MODELS.values()],
+        active=store.model_key() or models.DEFAULT_MODEL, default=models.DEFAULT_MODEL)
+
+
+@app.post("/model", response_model=StatusResponse)
+def set_model(request: ModelRequest) -> StatusResponse:
+    """Switch the index to another embedding model. Files aren't re-read and keyword search keeps working; their
+    vectors are redone in the background with the new model (poll /status). No-op if it's already the model."""
+    key = _model_key(request.model)
+    if not store.ready():
+        raise HTTPException(status_code=409, detail="Index a folder first, or pass the model to /index")
+    if key == store.model_key():
+        return status()
+    if not index_lock.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail="Already indexing a folder")
+    try:
+        store.set_model(key)
+        _start_embedding()
+    finally:
+        index_lock.release()
+    return status()
 
 
 @app.get("/file", response_model=FileResponse)

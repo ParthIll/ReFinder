@@ -39,7 +39,10 @@ function filterParams(f: Filters): string {
 }
 const formatDate = (t: number) => t ? new Date(t * 1000).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' }) : '—';
 const formatSize = (b: number) => b < 1e3 ? `${b} B` : b < 1e6 ? `${(b / 1e3).toFixed(0)} KB` : b < 1e9 ? `${(b / 1e6).toFixed(1)} MB` : `${(b / 1e9).toFixed(2)} GB`;
-type Status = { indexed_files: number; chunks: number; state: string; embedded_chunks: number; total_chunks: number; error: string | null; folder: string | null; folders: string[]; whole_computer: boolean; file_types: Record<string, number> };
+type Status = { indexed_files: number; chunks: number; state: string; embedded_chunks: number; total_chunks: number; error: string | null; folder: string | null; folders: string[]; whole_computer: boolean; file_types: Record<string, number>; model: string | null };
+// Embedding models the backend offers (refinder/models.py); the index uses one at a time.
+type ModelInfo = { key: string; label: string; description: string; gpu_recommended: boolean };
+type Models = { models: ModelInfo[]; active: string; default: string };
 type Theme = 'system' | 'light' | 'dark';
 type Mode = 'smart' | 'keyword';
 const API = import.meta.env.DEV ? '/api' : 'http://127.0.0.1:8000';
@@ -100,6 +103,9 @@ function App() {
   const [openWith, setOpenWith] = useState<{ path: string; default: App | null; apps: App[]; loading: boolean } | null>(null);
   const openWithRef = useRef<HTMLDivElement>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [models, setModels] = useState<Models | null>(null);
+  // Model for the next index when nothing is indexed yet; once indexed, the index's own model wins.
+  const [preferredModel, setPreferredModel] = useState(() => localStorage.getItem('refinder-model') || '');
   const inputRef = useRef<HTMLInputElement>(null);
   const typeMenuRef = useRef<HTMLDetailsElement>(null);
   // Close the file-type menu on any click outside it.
@@ -116,6 +122,19 @@ function App() {
     try { setStatus(await request<Status>('/status')); } catch { setStatus(null); }
   }
   useEffect(() => { void refreshStatus(); }, []);
+  useEffect(() => { request<Models>('/models').then(setModels).catch(() => setModels(null)); }, [status?.model]);
+  const activeModel = status?.indexed_files ? status.model || models?.active || '' : preferredModel || models?.default || '';
+  const modelInfo = models?.models.find(m => m.key === activeModel);
+  async function chooseModel(key: string) {
+    const info = models?.models.find(m => m.key === key);
+    if (!info || key === activeModel) return;
+    setPreferredModel(key); localStorage.setItem('refinder-model', key);
+    if (!status?.indexed_files) return;  // used by the next index
+    if (!window.confirm(`Switch to ${info.label} (${info.description})? Your files stay searchable by keyword while they are re-processed with the new model.`)) { setPreferredModel(activeModel); return; }
+    try {
+      setStatus(await request<Status>('/model', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ model: key }) }));
+    } catch (e) { setError(e instanceof Error ? e.message : 'Could not switch model'); }
+  }
   // Files are keyword-searchable as soon as /index returns; meaning-based results fill in while embedding runs.
   const indexing = status?.state === 'extracting' || status?.state === 'embedding';
   useEffect(() => { if (!indexing) return; const t = setInterval(() => void refreshStatus(), 1000); return () => clearInterval(t); }, [indexing]);
@@ -186,8 +205,9 @@ function App() {
   const currentFolder = folders[folders.length - 1] || '';
   const isHome = (f: string) => shortPath(f) === '~';
   const folderLabel = status?.whole_computer && folders.length === 1 ? 'Whole computer' : folders.length > 1 ? `${folders.length} folders` : currentFolder ? filename(currentFolder) : '';
-  async function startIndex(body: { folder?: string; whole_computer?: boolean; mode?: 'add' | 'replace' }, label: string) {
+  async function startIndex(body: { folder?: string; whole_computer?: boolean; mode?: 'add' | 'replace'; model?: string }, label: string) {
     setBusy(true); setError('');
+    if (activeModel) body = { ...body, model: activeModel };  // "add" to an existing index keeps the index's model
     // /index returns once files are read; poll meanwhile so the sidebar shows "Reading files…".
     const poll = setTimeout(() => void refreshStatus(), 300);
     try {
@@ -284,7 +304,7 @@ function App() {
       <div className="compact-footer"><span>{selected ? filename(selected.path) : 'Select a result to preview'}</span><span className="footer-actions"><button onClick={() => selected && void openFile(selected.path)} disabled={!selected}>Open <span>⌘ O</span></button><button onClick={() => setPreviewOpen(true)} disabled={!selected}>Preview <span>⌘ Y</span></button></span></div>
     </main>
     {previewOpen && <div className={`preview-overlay ${expanded ? 'wide' : ''}`} onClick={() => { setPreviewOpen(false); setExpanded(false); }}><div className="preview-sheet" onClick={e => e.stopPropagation()}>{preview}</div></div>}
-    {settingsOpen && <div className="modal-backdrop" onClick={() => setSettingsOpen(false)}><section className="settings panel" role="dialog" aria-modal="true" aria-labelledby="settings-title" onClick={e => e.stopPropagation()}><div className="settings-header"><h2 id="settings-title">Settings</h2><button className="icon-button" onClick={() => setSettingsOpen(false)} aria-label="Close settings"><Icon name="close"/></button></div><label htmlFor="theme">Appearance</label><select id="theme" value={theme} onChange={e => setTheme(e.target.value as Theme)}><option value="system">System</option><option value="light">Light</option><option value="dark">Dark</option></select><p>ReFinder uses the local search index on this computer.</p></section></div>}
+    {settingsOpen && <div className="modal-backdrop" onClick={() => setSettingsOpen(false)}><section className="settings panel" role="dialog" aria-modal="true" aria-labelledby="settings-title" onClick={e => e.stopPropagation()}><div className="settings-header"><h2 id="settings-title">Settings</h2><button className="icon-button" onClick={() => setSettingsOpen(false)} aria-label="Close settings"><Icon name="close"/></button></div><label htmlFor="theme">Appearance</label><select id="theme" value={theme} onChange={e => setTheme(e.target.value as Theme)}><option value="system">System</option><option value="light">Light</option><option value="dark">Dark</option></select>{models && <div className="model-setting"><label htmlFor="model">Search model</label><select id="model" value={activeModel} disabled={indexing} onChange={e => void chooseModel(e.target.value)}>{models.models.map(m => <option key={m.key} value={m.key}>{m.label}{m.gpu_recommended ? ' (GPU recommended)' : ''}</option>)}</select>{modelInfo && <p className="model-description">{modelInfo.description}</p>}</div>}<p>ReFinder uses the local search index on this computer.</p></section></div>}
   </div>;
 }
 export default App;
