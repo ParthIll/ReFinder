@@ -160,3 +160,20 @@ hits, as in `evaluation.custom` (the app ranks two identical copies one after th
 - The app's Harrier meaning ranking (0.614 / 0.785 / 0.904) is below the benchmark's (0.648 / 0.823 / 0.957):
   the app scores only files near the top 400 chunks and 100 file vectors, while the benchmark scores every file.
 - Search: the Harrier reranker adds ~0.4 s per query on the Mac GPU; CPU not measured yet.
+
+## Per-model BM25 weight (Nov 12, 2026)
+`ModelSpec.w_kw` sets BM25's weight against the meaning ranking (weight 1); filename and phrase bonuses unchanged.
+`python -m evaluation.api_eval --models harrier-270m --w-kw 1 0.5 0.25 0.1 0` (one index, five fusions, Mac GPU):
+
+| Harrier 270M, w_kw | Team Hit@1 / @5 | OrgSmith | Sample |
+|---|---|---|---|
+| 1 (old) | 0.598 / 0.789 | 0.623 / 0.928 | 0.870 / 0.974 |
+| 0.5 | 0.611 / 0.806 | 0.623 / 0.931 | 0.861 / 0.974 |
+| **0.25 (shipped)** | **0.633 / 0.820** | 0.621 / 0.926 | 0.861 / 0.983 |
+| 0.1 | 0.618 / 0.842 | 0.618 / 0.924 | 0.861 / 1.000 |
+| 0 (meaning only + bonuses) | 0.624 / 0.841 | 0.616 / 0.919 | 0.861 / 1.000 |
+
+Rule: best team Hit@1 losing at most 1 point on OrgSmith and 1 sample query. 0.25 passes (+23 team queries).
+Keywords still help a little: 0 is below 0.25 on every set. Only Harrier 270M was swept; Harrier 0.6B, bge-small
+and MiniLM keep 1. (w_kw 1 gives 0.598 here vs 0.600 above: run-to-run GPU noise.) Idea from scry
+(github.com/xxx12e/scry), which weights meaning 0.7 / keywords 0.3.

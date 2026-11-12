@@ -20,6 +20,7 @@ class ModelSpec:
     sampling: str  # which chunks a long file keeps: "head" (first half of the budget + the rest spread) or "even"
     file_vector: bool = False  # also score each file by the mean of its chunk vectors, minus a giant-file penalty
     reranker: str | None = None  # cross-encoder that re-scores the top chunks of each search, fused by rank
+    w_kw: float = 1.0  # BM25's weight against the meaning ranking (weight 1) in the app's rank fusion
     gpu_recommended: bool = False
     fp16: bool = True  # half precision on a GPU (~1.3x faster); off for models whose values overflow in fp16
 
@@ -31,6 +32,7 @@ MODELS: dict[str, ModelSpec] = {m.key: m for m in (
     ModelSpec("harrier-270m", "microsoft/harrier-oss-v1-270m", "Accurate",
               "Harrier 270M + reranker: best results without a GPU (about 4 min for 280 files on CPU)",
               max_chunks=100, sampling="even", file_vector=True, reranker="Alibaba-NLP/gte-reranker-modernbert-base",
+              w_kw=0.25,  # team Hit@1 0.598 -> 0.633, OrgSmith and sample within 1 point (ITERATIONS.md)
               fp16=False),  # Harrier (Gemma 3) gives NaN vectors in fp16; it runs in its own bfloat16 on a GPU
     ModelSpec("harrier-0.6b", "microsoft/harrier-oss-v1-0.6b", "Most accurate",
               "Harrier 0.6B + reranker: highest accuracy; slow without a GPU",

@@ -699,11 +699,12 @@ class ChromaIndex:
             return []
         mask = self.filter_mask(filters)
         sig = self.signals(query, query_vec, mask)
-        score = self.fuse(sig, len(self.manifest["paths"]))
+        w_kw = self.spec().w_kw
+        score = self.fuse(sig, len(self.manifest["paths"]), w_kw=w_kw)
         if mask is not None:
             score[~mask] = 0
         top = [int(f) for f in np.argsort(-score, kind="stable")[:k] if score[f] > 0]
-        best_possible = W_NAME + (W_KW + W_DENSE) / (RRF_K + 1)
+        best_possible = W_NAME + (w_kw + W_DENSE) / (RRF_K + 1)
         dense_hit = {f: (text, ci) for f, text, ci in sig["dense"] if text}
         phrase = " ".join(_words(query))
         results = []
