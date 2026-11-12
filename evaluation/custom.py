@@ -43,6 +43,7 @@ import hashlib
 import itertools
 import json
 import pickle
+import os
 import random
 import sys
 import time
@@ -90,8 +91,51 @@ def _extract_one(p: Path, use_cache: bool) -> tuple[str, object]:
         return "failed", f"{type(e).__name__}: {e}"
 
 
+# Folders never worth searching when indexing a whole home folder: apps, OS/app data, caches, code dependencies.
+SYSTEM_DIRS = frozenset({
+    "Library", "Applications", "Applications (Parallels)", "node_modules", "site-packages", "__pycache__",
+    "venv", "env", "miniforge3", "miniconda3", "anaconda3", "dist-packages", "bower_components", "Pods", "DerivedData", "build", "target", "vendor", "chroma_db",
+})
+# macOS packages that look like folders (apps, photo libraries) hold app data, not documents.
+PACKAGE_SUFFIXES = (".app", ".photoslibrary", ".bundle", ".framework", ".plugin", ".kext", ".xcodeproj",
+                    ".xcworkspace", ".musiclibrary", ".tvlibrary", ".lrdata", ".fcpbundle")
+MAX_FILE_MB = 100
+
+
+def _size(p: Path) -> int:
+    try:
+        return p.stat().st_size
+    except OSError:
+        return 0
+
+
+def list_files(root: Path, whole_computer: bool = False) -> list[Path]:
+    """Supported files under root, sorted. whole_computer skips hidden, system, app and dependency folders and
+    files over MAX_FILE_MB, and never follows symlinks (they can loop or leave the home folder)."""
+    from refinder.extract import SUPPORTED_SUFFIXES
+
+    if not whole_computer:
+        return [p for p in sorted(root.rglob("*")) if p.is_file()]
+    found = []
+    for dirpath, dirnames, filenames in os.walk(root, onerror=lambda e: None):
+        dirnames[:] = [d for d in dirnames if not d.startswith(".") and d not in SYSTEM_DIRS
+                       and not d.endswith(PACKAGE_SUFFIXES)]
+        for name in filenames:
+            if name.startswith((".", "~$")) or Path(name).suffix.lower() not in SUPPORTED_SUFFIXES:
+                continue
+            p = Path(dirpath) / name
+            try:
+                if p.is_symlink() or not p.is_file() or p.stat().st_size > MAX_FILE_MB * 1e6:
+                    continue
+            except OSError:  # vanished or no permission
+                continue
+            found.append(p)
+    return sorted(found)
+
+
 def load_corpus(
-    root: Path, exclude: set[Path] = frozenset(), use_cache: bool = True, workers: int = 1
+    root: Path, exclude: set[Path] = frozenset(), use_cache: bool = True, workers: int = 1,
+    files: list[Path] | None = None,
 ) -> tuple[list[str], list[str], list[list[Piece]], dict]:
     """Returns (relative paths, texts, pieces, extraction stats) for every supported file under root.
 
@@ -99,13 +143,13 @@ def load_corpus(
     """
     paths, texts, pieces, skipped, empty, failed = [], [], [], Counter(), [], {}
     t0 = time.perf_counter()
-    files = [p for p in sorted(root.rglob("*")) if p.is_file() and p.resolve() not in exclude]
+    files = [p for p in (list_files(root) if files is None else files) if p.resolve() not in exclude]
     if workers > 1:
         from concurrent.futures import ProcessPoolExecutor
 
         with ProcessPoolExecutor(workers) as pool:
             # Biggest files first so one huge PDF doesn't start last and leave the other workers idle.
-            order = sorted(range(len(files)), key=lambda i: -files[i].stat().st_size)
+            order = sorted(range(len(files)), key=lambda i: -_size(files[i]))
             done = dict(zip(order, pool.map(_extract_one, [files[i] for i in order], [use_cache] * len(files))))
         results = [done[i] for i in range(len(files))]
     else:

@@ -6,15 +6,17 @@ rankings (see evaluation/database.py), so results improve while embedding runs.
 """
 
 import os
+import re
 import threading
 from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse as RawFileResponse
 from pydantic import BaseModel
 
-from evaluation.database import Cancelled, ChromaIndex
+from evaluation.database import Cancelled, ChromaIndex, Filters
 
 # Fastest model at good accuracy in the benchmark; fp16 is ~1.3x faster on GPU/MPS with the same results.
 MODEL_NAME = "BAAI/bge-small-en-v1.5"
@@ -27,12 +29,19 @@ PARALLEL_MIN_FILES = 200
 # ---------------------------------------------------------
 
 class IndexRequest(BaseModel):
-    folder: str
+    # Folder to index; ignored when whole_computer is set.
+    folder: str = ""
+    # Index the user's home folder, skipping hidden, system, app and dependency folders.
+    whole_computer: bool = False
+    # "replace": the index becomes this folder only. "add": index this folder's new files alongside the folders
+    # already indexed, without re-reading or re-embedding those.
+    mode: str = "replace"
 
 
 class IndexResponse(BaseModel):
     status: str
-    files_queued: int
+    files_queued: int  # new files read by this request
+    total_files: int
     failed: int
     extract_s: float
 
@@ -42,11 +51,20 @@ class SearchResult(BaseModel):
     # 0-1 relevance from rank fusion: 1.0 = ranked first by both keyword and meaning search.
     score: float
     snippet: str
+    # The full matched passage (best chunk or paragraph), for highlighting it in the preview.
+    passage: str = ""
     chunk_id: int | None
+    # Unix seconds; "added" is macOS Date Added (falls back to creation time).
+    modified: float
+    added: float
+    size: int
+    type: str
 
 
 class SearchResponse(BaseModel):
     results: list[SearchResult]
+    # Keyword mode only: the query with misspelled words corrected, e.g. "paystbu" -> "paystub".
+    suggestion: str | None = None
 
 
 class StatusResponse(BaseModel):
@@ -57,11 +75,25 @@ class StatusResponse(BaseModel):
     embedded_chunks: int
     total_chunks: int
     error: str | None = None
+    # The indexed folder (absolute path), if any; `folders` lists every indexed folder.
+    folder: str | None = None
+    folders: list[str] = []
+    whole_computer: bool = False
+    # Indexed files per type, e.g. {"pdf": 312, "docx": 80}, for the type filter.
+    file_types: dict[str, int] = {}
 
 
 class FileResponse(BaseModel):
     path: str
     text: str
+
+
+class OpenRequest(BaseModel):
+    path: str
+    # Show the file in Finder / Explorer instead of opening it.
+    reveal: bool = False
+    # Open with this application (macOS .app path) instead of the default one.
+    app: str | None = None
 
 
 # ---------------------------------------------------------
@@ -77,10 +109,6 @@ app.add_middleware(
     allow_methods=["GET", "POST"],
     allow_headers=["Content-Type"],
 )
-
-corpus_root: Path | None = None
-paths: list[str] = []
-texts: list[str] = []
 
 store = ChromaIndex()
 embedder: Any | None = None
@@ -122,14 +150,9 @@ def _start_embedding() -> None:
 
 
 def _restore_from_disk() -> None:
-    """Reload the last index; finish embedding it if the server stopped part way."""
-    global corpus_root, paths, texts
-    loaded = store.load()
-    if loaded is None:
-        return
-    corpus_root, paths, texts = loaded
-    if not store.embedding_complete():
-        store.build_keyword(corpus_root, paths, store.manifest["pieces"], store.model_name() or MODEL_NAME)
+    """Reload the last index; finish embedding it if the server stopped part way (resumes after the files that
+    were already embedded)."""
+    if store.load() and not store.embedding_complete():
         _start_embedding()
 
 
@@ -142,30 +165,42 @@ _restore_from_disk()
 
 @app.post("/index", response_model=IndexResponse)
 def index_folder(request: IndexRequest) -> IndexResponse:
-    """Index a folder, replacing the current index. Returns once keyword search is ready; embedding continues in
-    the background (poll /status)."""
-    global corpus_root, paths, texts, index_state, index_error, embedder
+    """Index a folder, replacing the current index or adding to it. Returns once keyword search is ready; embedding
+    continues in the background (poll /status)."""
+    global index_state, index_error, embedder
 
-    from evaluation.custom import load_corpus
+    from evaluation.custom import list_files, load_corpus
 
-    folder = Path(request.folder).expanduser().resolve()
+    folder = Path.home() if request.whole_computer else Path(request.folder).expanduser().resolve()
     if not folder.is_dir():
         raise HTTPException(status_code=404, detail="Folder not found")
     if not index_lock.acquire(blocking=False):
         raise HTTPException(status_code=409, detail="Already indexing a folder")
+    adding = request.mode == "add" and store.ready()
+    prev_state = index_state
     try:
         index_state, index_error = "extracting", None
-        n_files = sum(1 for p in folder.rglob("*") if p.is_file())
-        workers = min(8, os.cpu_count() or 1) if n_files >= PARALLEL_MIN_FILES else 1
-        new_paths, new_texts, new_pieces, stats = load_corpus(folder, workers=workers)
+        files = list_files(folder, whole_computer=request.whole_computer)
+        if adding:  # never re-read files that are already indexed (e.g. a parent of an indexed folder)
+            known = set(store.manifest["paths"])
+            files = [f for f in files if str(f) not in known]
+            if not files:
+                index_state = prev_state
+                return IndexResponse(status="unchanged", files_queued=0, total_files=len(known), failed=0,
+                                     extract_s=0.0)
+        workers = min(8, os.cpu_count() or 1) if len(files) >= PARALLEL_MIN_FILES else 1
+        new_paths, _, new_pieces, stats = load_corpus(folder, workers=workers, files=files)
         if not new_paths:
-            index_state = "idle"
+            index_state = prev_state if adding else "idle"
             raise HTTPException(status_code=400, detail="Folder contains no supported files")
-
-        if embedder is not None and embedder.model_name != MODEL_NAME:
-            embedder = None  # index built with an older model: switch to the current one
-        store.build_keyword(folder, new_paths, [[p.text for p in ps] for ps in new_pieces], MODEL_NAME)
-        corpus_root, paths, texts = folder, new_paths, new_texts
+        abs_paths = [str(folder / p) for p in new_paths]
+        piece_texts = [[p.text for p in ps] for ps in new_pieces]
+        if adding:
+            store.add(folder, abs_paths, piece_texts)
+        else:
+            if embedder is not None and embedder.model_name != MODEL_NAME:
+                embedder = None  # index built with an older model: switch to the current one
+            store.replace(folder, abs_paths, piece_texts, MODEL_NAME)
         _start_embedding()
     except HTTPException:
         raise
@@ -175,45 +210,171 @@ def index_folder(request: IndexRequest) -> IndexResponse:
     finally:
         index_lock.release()
 
-    return IndexResponse(status="searchable", files_queued=len(paths), failed=len(stats["failed"]),
+    return IndexResponse(status="searchable", files_queued=len(new_paths), total_files=len(store.manifest["paths"]),
+                         failed=len(stats["failed"]),
                          extract_s=round(stats["extract_s"], 2))
 
 
 @app.get("/search", response_model=SearchResponse)
-def search(q: str, k: int = Query(default=5, ge=1, le=20),
-           mode: str = Query(default="smart", pattern="^(smart|keyword)$")) -> SearchResponse:
-    """mode=smart: filename + phrase + keyword + meaning. mode=keyword: plain BM25 keyword match only."""
+def search(
+    q: str = "",
+    k: int = Query(default=5, ge=1, le=100),
+    mode: str = Query(default="smart", pattern="^(smart|keyword)$"),
+    types: str | None = Query(default=None, description="Comma-separated extensions, e.g. pdf,docx"),
+    modified_after: float | None = Query(default=None, description="Unix seconds"),
+    modified_before: float | None = None,
+    added_after: float | None = None,
+    added_before: float | None = None,
+    min_size: int | None = Query(default=None, ge=0, description="Bytes"),
+    max_size: int | None = Query(default=None, ge=0),
+    folder: str | None = Query(default=None, description="Substring of the file's folder path"),
+) -> SearchResponse:
+    """mode=smart: filename + phrase + keyword + meaning. mode=keyword: plain BM25 keyword match only.
+    Filters narrow either mode; with filters and no query, lists matching files newest first."""
     if not store.ready():
         raise HTTPException(status_code=409, detail="Index a folder before searching")
+    filters = Filters(
+        types={t.strip().lower().lstrip(".") for t in types.split(",") if t.strip()} if types else None,
+        modified_after=modified_after, modified_before=modified_before,
+        added_after=added_after, added_before=added_before,
+        min_size=min_size, max_size=max_size, folder=folder or None,
+    )
+    if not q.strip():
+        if not filters.active():
+            raise HTTPException(status_code=422, detail="Enter a search or set a filter")
+        return SearchResponse(results=[SearchResult(**hit) for hit in store.browse(filters, k=k)])
     if mode == "keyword":
-        return SearchResponse(results=[SearchResult(**hit) for hit in store.keyword_search(q, k=k)])
+        return SearchResponse(results=[SearchResult(**hit) for hit in store.keyword_search(q, k=k, filters=filters)],
+                              suggestion=store.suggest(q))
     query_vec = None
     if store.count():  # skip loading the model while only keyword search is available
         enc = _get_embedder()
         with model_lock:
             query_vec = enc.encode_query(q)
-    return SearchResponse(results=[SearchResult(**hit) for hit in store.search(q, query_vec, k=k)])
+    return SearchResponse(results=[SearchResult(**hit) for hit in store.search(q, query_vec, k=k, filters=filters)])
 
 
 @app.get("/status", response_model=StatusResponse)
 def status() -> StatusResponse:
+    roots = store.roots()
     return StatusResponse(
-        indexed_files=len(paths),
+        indexed_files=len(store.manifest["paths"]) if store.manifest else 0,
         chunks=store.count(),
         state=index_state,
         embedded_chunks=store.embedded_chunks,
         total_chunks=store.total_chunks,
         error=index_error,
+        folder=roots[0] if len(roots) == 1 else None,
+        folders=roots,
+        whole_computer=str(Path.home()) in roots,
+        file_types=store.file_types(),
     )
 
 
 @app.get("/file", response_model=FileResponse)
 def get_file(path: str) -> FileResponse:
-    try:
-        index = paths.index(path)
-    except ValueError:
+    text = store.file_text(path) if store.ready() else None
+    if text is None:
         raise HTTPException(status_code=404, detail="Indexed file not found")
-    return FileResponse(path=paths[index], text=texts[index])
+    return FileResponse(path=path, text=text)
+
+
+def _indexed_file(path: str) -> tuple[Path, str]:
+    """The path and extracted text of an indexed file; 404 for anything else, so these endpoints can't read or
+    open arbitrary files."""
+    text = store.file_text(path) if store.ready() else None
+    if text is None:
+        raise HTTPException(status_code=404, detail="Indexed file not found")
+    p = Path(path)
+    if not p.is_file():
+        raise HTTPException(status_code=410, detail="File was moved or deleted since it was indexed")
+    return p, text
+
+
+@app.get("/preview")
+def preview_file(path: str) -> dict[str, Any]:
+    """What the preview panel shows: {"kind": "pdf" | "docx" | "table" | "slides" | "text", ...}."""
+    from evaluation.preview import preview
+
+    p, text = _indexed_file(path)
+    return preview(p, text)
+
+
+@app.get("/raw")
+def raw_file(path: str) -> RawFileResponse:
+    """The file's bytes, for rendering PDFs and Word documents in the app."""
+    p, _ = _indexed_file(path)
+    return RawFileResponse(p, filename=p.name, content_disposition_type="inline")
+
+
+@app.get("/thumbnail")
+def file_thumbnail(path: str) -> RawFileResponse:
+    """A PNG of the first page or slide (macOS Quick Look)."""
+    from evaluation.preview import thumbnail
+
+    p, _ = _indexed_file(path)
+    png = thumbnail(p)
+    if png is None:
+        raise HTTPException(status_code=404, detail="No thumbnail available")
+    return RawFileResponse(png, media_type="image/png")
+
+
+@app.get("/quicklook/{key}/{name}")
+def quicklook_file(key: str, name: str) -> RawFileResponse:
+    """Files of a Quick Look HTML render made by /preview (the page and its images)."""
+    from evaluation.preview import QUICKLOOK_FILE, quicklook_dir
+
+    if not re.fullmatch(r"[0-9a-f]{40}", key) or not QUICKLOOK_FILE.match(name):
+        raise HTTPException(status_code=404, detail="Not found")
+    f = quicklook_dir(key) / name
+    if not f.is_file():
+        raise HTTPException(status_code=404, detail="Not found")
+    return RawFileResponse(f)
+
+
+IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp", ".avif"}
+
+
+@app.get("/asset")
+def asset_file(path: str) -> RawFileResponse:
+    """An image inside an indexed folder, for pictures that Markdown files link to (e.g. ![](img/chart.png))."""
+    p = Path(path).resolve()
+    roots = [Path(r).resolve() for r in store.roots()]
+    if p.suffix.lower() not in IMAGE_SUFFIXES or not any(p.is_relative_to(r) for r in roots) or not p.is_file():
+        raise HTTPException(status_code=404, detail="Not found")
+    return RawFileResponse(p)
+
+
+@app.post("/open")
+def open_file(request: OpenRequest) -> dict[str, str]:
+    """Open an indexed file in its default app, or reveal it in Finder."""
+    from evaluation.preview import is_app, open_file as open_path
+
+    p, _ = _indexed_file(request.path)
+    app = Path(request.app) if request.app else None
+    if app is not None and not is_app(app):
+        raise HTTPException(status_code=400, detail="Not an application")
+    open_path(p, reveal=request.reveal, app=app)
+    return {"status": "opened"}
+
+
+@app.get("/open-with")
+def open_with(path: str) -> dict[str, Any]:
+    """Apps that can open this file, as in Finder's Open With menu (macOS)."""
+    from evaluation.preview import open_with_apps
+
+    p, _ = _indexed_file(path)
+    return open_with_apps(p)
+
+
+@app.get("/app-icon")
+def application_icon(app: str) -> RawFileResponse:
+    from evaluation.preview import app_icon
+
+    png = app_icon(Path(app))
+    if png is None:
+        raise HTTPException(status_code=404, detail="No icon")
+    return RawFileResponse(png, media_type="image/png", headers={"Cache-Control": "max-age=86400"})
 
 
 @app.get("/")

@@ -53,10 +53,18 @@ persistence, API; Frontend owns setup/search/preview UX.
   works immediately), then a background thread embeds up to 20 paragraph chunks per file with bge-small fp16 into
   Chroma (`evaluation/chroma_db/`). `/status` reports `extracting`/`embedding` progress; `/search` is literal-first:
   filename match (share of query words, squared; fuzzy) + exact-phrase bonus + RRF(k=60) of BM25 (typo-corrected)
-  and dense (best chunk per file); score scaled to 0-1. `manifest.json` keeps paths + extracted
-  pieces so BM25 is rebuilt on restart (an interrupted embed restarts). Matches `custom.py --models
+  and dense (best chunk per file); score scaled to 0-1. `/search?mode=keyword` is plain BM25 with a "did you mean"
+  suggestion; filters (type, modified, macOS Date Added, size, folder) narrow both modes, and filters with no query
+  list matching files newest first. `/index` takes `mode=replace|add`: add reads and embeds only files not yet indexed
+  (doc ids are append-only, so existing vectors stay), then rebuilds BM25 over everything; `whole_computer` indexes
+  the home folder minus hidden/system/app/dependency folders (`custom.list_files`). `manifest.json` keeps roots,
+  absolute paths and extracted pieces so BM25 is rebuilt on restart; embedding resumes from `embedded_docs`.
+  `/preview`, `/raw`, `/thumbnail`, `/open` (evaluation/preview.py) serve the app's file viewer and open/reveal
+  actions, only for indexed paths; the frontend renders PDFs with pdf.js and DOCX with docx-preview (`Preview.tsx`),
+  PPTX as Quick Look HTML (macOS, `/quicklook/{key}/`), and highlights each result's `passage` by word overlap
+  (`highlight.ts`). Matches `custom.py --models
   BAAI/bge-small-en-v1.5 --fp16 --max-chunks 20 --hybrid`; team corpus via the API: Hit@1 0.414 / Hit@5 0.755,
-  searchable in ~15 s, fully embedded in ~75 s. Still one folder at a time; no SQLite ledger or incremental rescan.
+  searchable in ~15 s, fully embedded in ~75 s. No folder removal, SQLite ledger or rescan of changed files yet.
 - `evaluation/custom.py` — main benchmark: corpus folder + query CSV(s); auto-discovers the team's per-folder
   query CSVs (source_file/corpus_path, secondary_relevant_files, query_type, split). Dense vs BM25, Hit@1/5/10,
   Recall@10, MRR@10, graded nDCG@10, breakdowns by folder/category/file type, latency, `--chunking`, `--tree-*`.
