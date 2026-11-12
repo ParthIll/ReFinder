@@ -16,3 +16,5 @@ python-pptx
 fonttools
 chromadb
 rapidfuzz
+onnx
+onnxruntime

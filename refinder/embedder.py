@@ -32,6 +32,14 @@ MODEL_PROMPTS = {
 # Models whose architecture code lives in the model repo rather than in transformers.
 REMOTE_CODE_MODELS = {"nomic-ai/nomic-embed-text-v1.5", "Snowflake/snowflake-arctic-embed-m-v2.0"}
 
+# Models that run through ONNX Runtime on CPU. float32 ONNX matched PyTorch's vectors (cosine 1.0000) and was faster
+# on an M5 Pro: Harrier 270M 18 -> 30 chunks/s, bge-small 92 -> 101, MiniLM 180 -> 196.
+ONNX_MODELS = {"microsoft/harrier-oss-v1-270m", "BAAI/bge-small-en-v1.5", "sentence-transformers/all-MiniLM-L6-v2"}
+
+# Larger batches were slower on both CPU and GPU (Harrier 270M on MPS: 131 chunks/s at 16, 119 at 128), and use more
+# memory, so callers asking for more get batches of this size.
+MAX_BATCH = 32
+
 
 def pick_device() -> str:
     if torch.cuda.is_available():
@@ -55,7 +63,10 @@ class Chunk:
 class Embedder:
     def __init__(self, model_name: str = DEFAULT_MODEL, device: str | None = None, fp16: bool = False):
         self.model_name = model_name
-        self.model = SentenceTransformer(model_name, device=device or pick_device(),
+        device = device or pick_device()
+        # Harrier defaults to bfloat16, about 7x slower than float32 on CPU (1.6 vs 11.5 chunks/s for the 270m model).
+        model_kwargs = {"dtype": torch.float32} if device == "cpu" else None
+        self.model = SentenceTransformer(model_name, device=device, model_kwargs=model_kwargs,
                                          trust_remote_code=model_name in REMOTE_CODE_MODELS)
         # Half precision roughly halves the work per chunk on a GPU; CPUs gain nothing, so stay in fp32 there.
         self.fp16 = fp16 and self.model.device.type != "cpu"
@@ -70,6 +81,20 @@ class Embedder:
         for kind, prompt in MODEL_PROMPTS.get(model_name, {}).items():
             if not self.model.prompts.get(kind):
                 self.model.prompts[kind] = prompt
+        self.onnx_session = None
+        # The ONNX path reproduces the model's pooling itself, so it needs to know which one (and that the prompt
+        # tokens count toward it, as they do for every model listed in ONNX_MODELS).
+        pooling = next((m for m in self.model if type(m).__name__ == "Pooling"), None)
+        self.pooling_mode = getattr(pooling, "pooling_mode", None) if getattr(pooling, "include_prompt", False) else None
+        if device == "cpu" and model_name in ONNX_MODELS:
+            try:
+                from refinder.onnx_encoder import POOLING, load_session
+
+                if self.pooling_mode not in POOLING:
+                    raise ValueError(f"pooling {self.pooling_mode!r} not supported")
+                self.onnx_session = load_session(model_name, self.tokenizer)
+            except Exception as e:  # missing package or failed export: PyTorch gives the same vectors, just slower
+                print(f"  ONNX unavailable ({type(e).__name__}: {e}); using PyTorch")
 
     @staticmethod
     def _chunking_tokenizer(tok):
@@ -168,21 +193,32 @@ class Embedder:
     def _encode(self, fn, texts: list[str], batch_size: int, show_progress: bool) -> np.ndarray:
         return fn(
             texts,
-            batch_size=batch_size,
+            batch_size=min(batch_size, MAX_BATCH),
             normalize_embeddings=True,
             convert_to_numpy=True,
             show_progress_bar=show_progress,
         ).astype(np.float32)
+
+    def _encode_onnx(self, texts: list[str], prompt_kind: str, batch_size: int, show_progress: bool) -> np.ndarray:
+        from refinder.onnx_encoder import encode
+
+        prompt = self.model.prompts.get(prompt_kind) or ""
+        return encode(self.onnx_session, self.tokenizer, [prompt + t for t in texts], self.dim, self.max_seq_length,
+                      min(batch_size, MAX_BATCH), self.pooling_mode, show_progress)
 
     def encode(self, texts: list[str], batch_size: int = 64, show_progress: bool = False) -> np.ndarray:
         """Encode document-side texts to L2-normalized float32 vectors, shape (n, dim). Dot product == cosine.
 
         Uses the model's document prompt if it defines one (e.g. "passage: " for e5); a no-op for MiniLM.
         """
+        if self.onnx_session:
+            return self._encode_onnx(texts, "document", batch_size, show_progress)
         return self._encode(self.model.encode_document, texts, batch_size, show_progress)
 
     def encode_queries(self, queries: list[str], batch_size: int = 64) -> np.ndarray:
         """Encode search queries, applying the model's query prompt if it defines one."""
+        if self.onnx_session:
+            return self._encode_onnx(queries, "query", batch_size, False)
         return self._encode(self.model.encode_query, queries, batch_size, False)
 
     def encode_query(self, query: str) -> np.ndarray:

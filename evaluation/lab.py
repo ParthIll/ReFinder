@@ -14,6 +14,8 @@ Protocol (fixed before running any fix):
     python -m evaluation.lab --model harrier                      # evaluate the current state
     python -m evaluation.lab --model harrier --key w_mean --grid 0 0.25 0.5 1 --label "file mean vector"
     python -m evaluation.lab --model harrier --set w_ce=0 --dry   # one-off variation, not saved
+    python -m evaluation.lab --model harrier270 --set w_mean=1 w_size=0.02 w_ce=1 ce=gte \
+        --speed --key index --grid cap100 ov0                     # indexing shortcuts: how much accuracy they cost
 
 Nov 2026 results and the reasoning behind each kept/reverted change: evaluation/ITERATIONS.md.
 """
@@ -35,7 +37,7 @@ STATE = CACHE / "lab_state.json"
 LOG = CACHE / "lab_log.jsonl"
 
 MODELS = {"qwen3": "Qwen/Qwen3-Embedding-0.6B", "bge": "BAAI/bge-small-en-v1.5",
-          "harrier": "microsoft/harrier-oss-v1-0.6b"}
+          "harrier": "microsoft/harrier-oss-v1-0.6b", "harrier270": "microsoft/harrier-oss-v1-270m"}
 INSTR = {
     "default": None,
     "file": "Instruct: Given a description of a document someone wants to find on their computer, "
@@ -103,8 +105,23 @@ def _header(pieces: list[str]) -> str:
     return " ".join(first.split()[:HEADER_WORDS]) + "\n"
 
 
+def cap_keep(owner: np.ndarray, cap: int) -> np.ndarray:
+    """Chunk ids to keep when a file may have at most `cap` chunks: all of a small file's, evenly spaced ones of a
+    big file's (first and last included). Chunks are contiguous per file."""
+    starts = np.flatnonzero(np.r_[True, owner[1:] != owner[:-1]]) if len(owner) else np.array([], int)
+    keep = []
+    for s, e in zip(starts, np.r_[starts[1:], len(owner)]):
+        keep.append(np.arange(s, e) if e - s <= cap else s + np.unique(np.linspace(0, e - s - 1, cap).round().astype(int)))
+    return np.concatenate(keep) if keep else np.array([], int)
+
+
 def chunk_index(ds: dict, model: str, index: str = "plain"):
-    """plain: the app's chunks. hdr: each chunk prefixed with its document's opening words. c400: 400-token chunks."""
+    """plain: the app's chunks. hdr: each chunk prefixed with its document's opening words. c400: 400-token chunks.
+    capN: plain, but a file keeps at most N evenly spaced chunks. ovN: plain chunking with N tokens of overlap."""
+    if index.startswith("cap"):
+        vecs, owner = chunk_index(ds, model, "plain")
+        keep = cap_keep(owner, int(index[3:]))
+        return vecs[keep], owner[keep]
     if index == "plain":
         vecs, owner, _, _ = embed_corpus(embedder(model), ds["texts"], use_cache=True,
                                          pieces=[[p.text for p in ps] for ps in ds["pieces"]], chunking="paragraph")
@@ -119,10 +136,11 @@ def chunk_index(ds: dict, model: str, index: str = "plain"):
         texts, owner, _ = chunk_corpus(e, ds["texts"], piece_texts, "paragraph")
         heads = [_header(ps) for ps in piece_texts]
         texts = [heads[o] + t for t, o in zip(texts, owner)]
-    elif index == "c400":
+    elif index == "c400" or index.startswith("ov"):
+        size, overlap = (400, 80) if index == "c400" else (200, int(index[2:]))
         texts, owner = [], []
         for i, ps in enumerate(piece_texts):
-            for c in e.chunk_pieces(ps, 400, 80):
+            for c in e.chunk_pieces(ps, size, overlap):
                 texts.append(c.text)
                 owner.append(i)
         owner = np.array(owner, dtype=int)
@@ -132,6 +150,24 @@ def chunk_index(ds: dict, model: str, index: str = "plain"):
     vecs = e.encode(texts, batch_size=64)
     np.savez(f, vecs=vecs, owner=owner)
     return vecs, owner
+
+
+_TEXTS: dict[tuple, list[str]] = {}
+
+
+def index_texts(ds: dict, model: str, index: str) -> list[str]:
+    """Chunk texts aligned with chunk_index(ds, model, index) (plain, capN and ovN), for the reranker."""
+    key = (ds["name"], model, index)
+    if key not in _TEXTS:
+        piece_texts = [[p.text for p in ps] for ps in ds["pieces"]]
+        if index.startswith("ov"):
+            _TEXTS[key] = [c.text for ps in piece_texts for c in embedder(model).chunk_pieces(ps, 200, int(index[2:]))]
+        else:
+            texts, _, _ = chunk_corpus(embedder(model), ds["texts"], piece_texts, "paragraph")
+            if index.startswith("cap"):
+                texts = [texts[i] for i in cap_keep(chunk_index(ds, model, "plain")[1], int(index[3:]))]
+            _TEXTS[key] = texts
+    return _TEXTS[key]
 
 
 def query_vecs(ds: dict, model: str, instr: str) -> np.ndarray:
@@ -182,7 +218,9 @@ def index_data(ds: dict, model: str, index: str) -> dict:
             mv = vecs[s:e].mean(0)
             mean_vecs[f] = mv / max(float(np.linalg.norm(mv)), 1e-12)
             has[f] = True
-        n_chunks = np.bincount(owner, minlength=n_f).clip(min=1)
+        # A capped file still counts all its chunks for the size penalty, as the app would store the real count.
+        counts = chunk_index(ds, model, "plain")[1] if index.startswith("cap") else owner
+        n_chunks = np.bincount(counts, minlength=n_f).clip(min=1)
         size = np.maximum(np.log(n_chunks / (10 * np.median(n_chunks))), 0).astype(np.float32)
         _IDX[key] = dict(vecs=vecs, owner=owner, starts=starts, ends=ends, doc_ids=doc_ids, mean_vecs=mean_vecs,
                          has=has, size=size, n_files=n_f)
@@ -274,20 +312,22 @@ def ce_scores_depth(ds: dict, model: str, instr: str, ce: str, depth: int) -> np
     return out
 
 
-def ce_scores(ds: dict, model: str, instr: str, ce: str, hdr: bool = False) -> np.ndarray:
+def ce_scores(ds: dict, model: str, instr: str, ce: str, hdr: bool = False, index: str = "plain") -> np.ndarray:
     """Best cross-encoder probability per file among the CE_DEPTH best chunks (by raw chunk similarity); -inf else.
 
-    hdr: the reranker sees each passage prefixed with its document's own opening words (never the filename)."""
-    F = features(ds, model, instr, "plain")  # candidates always come from the app's own chunks
+    hdr: the reranker sees each passage prefixed with its document's own opening words (never the filename).
+    index: whose chunks are candidates; capN / ovN indexes rerank their own chunks, everything else plain's."""
+    F = features(ds, model, instr, index)
     tag = (ce, "hdr", HEADER_WORDS) if hdr else (ce,)
+    if index != "plain":
+        tag += (index,)
     f = CACHE / f"ce_{_key(ds['name'], model, instr, *tag, CE_DEPTH, *[q['query'] for q in ds['queries']])}.npy"
     if f.exists():
         return np.load(f)
     from sentence_transformers import CrossEncoder
     if ce not in _CE:
         _CE[ce] = CrossEncoder(CE_MODELS[ce], device=pick_device())
-    texts, _, _ = chunk_corpus(embedder(model), ds["texts"], [[p.text for p in ps] for ps in ds["pieces"]],
-                               "paragraph")
+    texts = index_texts(ds, model, index)
     C, owner = F["C"], F["owner"]
     if hdr:
         heads = [_header([p.text for p in ps]) for ps in ds["pieces"]]
@@ -353,7 +393,8 @@ def score(ds: dict, model: str, p: dict) -> np.ndarray:
             if p["ce_cand"] == "files":
                 ce = ce_scores_files(ds, model, p, s)
             elif p["ce_depth"] == CE_DEPTH:
-                ce = ce_scores(ds, model, p["instr"], p["ce"], bool(p["ce_hdr"]))
+                ce_index = p["index"] if p["index"].startswith(("cap", "ov")) else "plain"
+                ce = ce_scores(ds, model, p["instr"], p["ce"], bool(p["ce_hdr"]), ce_index)
             else:
                 ce = ce_scores_depth(ds, model, p["instr"], p["ce"], int(p["ce_depth"]))
             w = np.full(len(ce), p["w_ce"])
@@ -411,6 +452,52 @@ def parse(v: str):
         return v
 
 
+SPEED_MARGIN = 0.01  # an indexing shortcut may cost at most 1 Hit@1 point on team and OrgSmith, 1 sample query
+
+
+def speed_check(dsets, team, args, cur):
+    """Non-inferiority check for changes that make indexing cheaper (no tuning, so no LOMO needed)."""
+    base = {name: pooled(dsets, args.model, cur, prefix) for name, prefix in (("team", "team"), ("orgsmith", "org/"),
+                                                                              ("sample", "sample"))}
+    n_plain = {name: sum(len(index_data(d, args.model, cur["index"])["owner"]) for d in dsets
+                         if d["name"].startswith(prefix)) for name, prefix in (("team", "team"), ("orgsmith", "org/"))}
+    print(f"\n== speed check: {args.key} in {args.grid}   (base: {cur[args.key]}, "
+          f"team {n_plain['team']:,} chunks, orgsmith {n_plain['orgsmith']:,})")
+    for name, (r, _) in base.items():
+        m = metrics(r)
+        print(f"  base {name:<9} Hit@1 {m['Hit@1']:.3f}  Hit@5 {m['Hit@5']:.3f}  MRR {m['MRR']:.3f}")
+    for g in args.grid:
+        new = {**cur, args.key: g}
+        out = {name: pooled(dsets, args.model, new, prefix)[0] for name, prefix in (("team", "team"),
+                                                                                  ("orgsmith", "org/"), ("sample", "sample"))}
+        n_new = {name: sum(len(index_data(d, args.model, new["index"])["owner"]) for d in dsets
+                           if d["name"].startswith(prefix)) for name, prefix in (("team", "team"), ("orgsmith", "org/"))}
+        d_team = boot_ci(out["team"], base["team"][0], base["team"][1])
+        d_org = boot_ci(out["orgsmith"], base["orgsmith"][0], base["orgsmith"][1])
+        d_q = int((out["sample"] <= 1).sum() - (base["sample"][0] <= 1).sum())
+        ok = d_team[0] >= -SPEED_MARGIN and d_org[0] >= -SPEED_MARGIN and d_q >= -1
+        print(f"\n  {g}: team {n_new['team']:,} chunks ({n_new['team'] / n_plain['team'] * 100:.0f}%), "
+              f"orgsmith {n_new['orgsmith']:,} ({n_new['orgsmith'] / n_plain['orgsmith'] * 100:.0f}%)")
+        for name in out:
+            ma, mb = metrics(base[name][0]), metrics(out[name])
+            print(f"    {name:<9} Hit@1 {ma['Hit@1']:.3f} -> {mb['Hit@1']:.3f}   Hit@5 {ma['Hit@5']:.3f} -> {mb['Hit@5']:.3f}"
+                  f"   MRR {ma['MRR']:.3f} -> {mb['MRR']:.3f}")
+        print(f"    team dHit@1 {d_team[0]*100:+.1f} pts [{d_team[1]*100:+.1f}, {d_team[2]*100:+.1f}]   orgsmith "
+              f"{d_org[0]*100:+.1f} [{d_org[1]*100:+.1f}, {d_org[2]*100:+.1f}]   sample {d_q:+d} queries")
+        if args.key == "index" and str(g).startswith("cap"):
+            counts = np.bincount(chunk_index(team, args.model, "plain")[1], minlength=len(team["texts"]))
+            hit = np.array([any(counts[f] > int(g[3:]) for f in q["gold"]) for q in team["queries"]])
+            if hit.any():
+                print(f"    team queries aimed at a capped file: {hit.sum()}   Hit@1 {np.mean(base['team'][0][hit] <= 1):.3f}"
+                      f" -> {np.mean(out['team'][hit] <= 1):.3f}   Hit@5 {np.mean(base['team'][0][hit] <= 5):.3f}"
+                      f" -> {np.mean(out['team'][hit] <= 5):.3f}")
+        print(f"    {'PASS' if ok else 'FAIL'} (allowed: -{SPEED_MARGIN * 100:.0f} pt team and OrgSmith, -1 sample query)")
+        with LOG.open("a") as f:
+            f.write(json.dumps({"model": args.model, "label": args.label, "speed": True, "key": args.key, "value": g,
+                                "base": cur[args.key], "team": [metrics(base["team"][0]), metrics(out["team"])],
+                                "team_ci": d_team, "org_ci": d_org, "sample_dq": d_q, "chunks": n_new, "pass": ok}) + "\n")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="qwen3", choices=MODELS)
@@ -419,6 +506,8 @@ def main():
     ap.add_argument("--label", default="")
     ap.add_argument("--set", nargs="*", default=[], help="extra fixed params k=v for this run (not saved)")
     ap.add_argument("--dry", action="store_true", help="don't update the saved state")
+    ap.add_argument("--speed", action="store_true",
+                    help="grid values are indexing shortcuts: PASS if accuracy stays within SPEED_MARGIN, nothing saved")
     args = ap.parse_args()
 
     state = json.loads(STATE.read_text()) if STATE.exists() else {}
@@ -440,6 +529,9 @@ def main():
         for g in sorted(set(team["group"])):
             print(f"    {g:<8} Hit@1 {metrics(rt[team['group'] == g])['Hit@1']:.3f}")
         return
+
+    if args.speed:
+        return speed_check(dsets, team, args, cur)
 
     # ---- LOMO on the team corpus
     R = {g: ranks(team, args.model, {**cur, args.key: g}) for g in args.grid}

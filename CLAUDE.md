@@ -42,7 +42,13 @@ persistence, API; Frontend owns setup/search/preview UX.
   50 overlap) and `chunk_pieces` (packs whole extractor pieces to ~200 tokens with a 50-token carry-over and keeps
   piece ranges for locations). `MODEL_PROMPTS` adds missing query/document prefixes (bge query instruction, nomic);
   `REMOTE_CODE_MODELS` enables trust_remote_code. `DEFAULT_MODEL` is still `all-MiniLM-L6-v2`; the PRD's MVP model
-  is `BAAI/bge-small-en-v1.5` (384-d).
+  is `BAAI/bge-small-en-v1.5` (384-d). On CPU, models load in float32, and `ONNX_MODELS` (Harrier 270M, bge-small,
+  MiniLM) run through `refinder/onnx_encoder.py`, which exports to `.cache/onnx/` on first use, reproduces the
+  model's pooling (last-token, CLS or mean) and falls back to PyTorch on failure. `MAX_BATCH = 32` (bigger was slower).
+- `refinder/indexer.py` — the ML half of indexing, no storage: `index_files(paths, embedder)` yields per file its
+  chunks (text, ordinal, location), vectors, whole-file vector and full chunk count, smallest files first, batching
+  across files and embedding repeated texts once. Giant files keep `MAX_CHUNKS_PER_FILE = 100` evenly spaced chunks.
+  Meant to be called by the backend's worker; the API doesn't use it yet.
 - `refinder/extract.py` — bridge that loads `refinder-extractors/` via importlib as `refinder_extractors`, adds
   `.eml`, and turns labelled pieces ("Page 3 Paragraph 2", "Slide 4", "Row 12") into `Piece(text, location)`.
   `extract_text` joins pieces for callers that want one string.
@@ -65,6 +71,8 @@ persistence, API; Frontend owns setup/search/preview UX.
   (`highlight.ts`). Matches `custom.py --models
   BAAI/bge-small-en-v1.5 --fp16 --max-chunks 20 --hybrid`; team corpus via the API: Hit@1 0.414 / Hit@5 0.755,
   searchable in ~15 s, fully embedded in ~75 s. No folder removal, SQLite ledger or rescan of changed files yet.
+- `evaluation/index_bench.py` — indexing profiler: times extraction (uncached, per type, slowest files), chunking and
+  embedding per model / device / batch size, with `--cap`, `--int8`, `--limit-chunks` (extrapolates).
 - `evaluation/custom.py` — main benchmark: corpus folder + query CSV(s); auto-discovers the team's per-folder
   query CSVs (source_file/corpus_path, secondary_relevant_files, query_type, split). Dense vs BM25, Hit@1/5/10,
   Recall@10, MRR@10, graded nDCG@10, breakdowns by folder/category/file type, latency, `--chunking`, `--tree-*`.
@@ -94,6 +102,10 @@ persistence, API; Frontend owns setup/search/preview UX.
 - Best setup so far (evaluation/ITERATIONS.md): Harrier-0.6b + whole-file vector (`--file-vector 1`) + outlier
   size penalty (`--size-penalty 0.02`) + gte-reranker-modernbert-base fused by rank (`--rerank-fuse 1`):
   team 0.679 / OrgSmith 0.838 / sample 0.957 Hit@1, ~0.4 s per search. Not yet wired into the API.
+- Indexing speed (evaluation/ITERATIONS.md, "Indexing speed"): embedding is the cost (extraction ~1 min, chunking
+  ~2 s on the team corpus); 5 files hold 72% of its chunks. Capping files at 100 chunks passed the accuracy check;
+  overlap 25 or 0 failed; int8 and static models were measured and not adopted.
+  `python -m evaluation.lab --model harrier270 --set w_mean=1 w_size=0.02 w_ce=1 ce=gte --speed --key index --grid cap100`
 - 54 team-corpus files are exact duplicates (Dagem/Sanjay CS 314 slides). Ties count as hits; any rank fusion must
   give tied scores the same rank. Use `python -m evaluation.lab` (leave-one-member-out + bootstrap) for new changes.
 - Never commit corpora, results, or Chroma data (`.cache/`, `evaluation/results/`, `chroma_db/`, `datasets/`).
