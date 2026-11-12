@@ -10,6 +10,7 @@ from tqdm import tqdm
 from transformers import AutoModel
 
 CACHE_DIR = Path(__file__).resolve().parent.parent / ".cache" / "onnx"
+POOLING = ("lasttoken", "cls", "mean")  # Sentence Transformers pooling modes this module reproduces
 
 
 class _LastHiddenState(torch.nn.Module):
@@ -18,9 +19,11 @@ class _LastHiddenState(torch.nn.Module):
     def __init__(self, model):
         super().__init__()
         self.model = model
+        # Decoder-style models (Harrier, Qwen3) would otherwise build a key/value cache; encoders don't take the flag.
+        self.extra = {"use_cache": False} if getattr(model.config, "use_cache", None) is not None else {}
 
     def forward(self, input_ids, attention_mask):
-        return self.model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False).last_hidden_state
+        return self.model(input_ids=input_ids, attention_mask=attention_mask, **self.extra).last_hidden_state
 
 
 def _export(model_name: str, tokenizer, path: Path) -> None:
@@ -38,19 +41,29 @@ def _export(model_name: str, tokenizer, path: Path) -> None:
     tmp.replace(path)
 
 
-def load_session(model_name: str, tokenizer) -> ort.InferenceSession:
+def load_session(model_name: str, tokenizer, int8: bool = False) -> ort.InferenceSession:
+    """int8: weights quantized to 8-bit integers. Not used by the app (no faster on Apple silicon, slightly less
+    accurate); evaluation.index_bench --int8 measures it on other CPUs."""
     path = CACHE_DIR / model_name.replace("/", "--") / "model.onnx"
     if not path.exists():
         print(f"  exporting {model_name} to ONNX (first run only)...")
         _export(model_name, tokenizer, path)
+    if int8:
+        from onnxruntime.quantization import QuantType, quantize_dynamic
+
+        quantized = path.with_name("model_int8.onnx")
+        if not quantized.exists():
+            quantize_dynamic(str(path), str(quantized), weight_type=QuantType.QInt8, op_types_to_quantize=["MatMul"])
+        path = quantized
     options = ort.SessionOptions()
     options.intra_op_num_threads = torch.get_num_threads()
     return ort.InferenceSession(str(path), options, providers=["CPUExecutionProvider"])
 
 
-def encode_last_token(session: ort.InferenceSession, tokenizer, texts: list[str], dim: int, max_length: int,
-                      batch_size: int, show_progress: bool = False) -> np.ndarray:
-    """L2-normalized float32 vectors, shape (n, dim), using last-token pooling (the only pooling Harrier uses)."""
+def encode(session: ort.InferenceSession, tokenizer, texts: list[str], dim: int, max_length: int, batch_size: int,
+           pooling: str, show_progress: bool = False) -> np.ndarray:
+    """L2-normalized float32 vectors, shape (n, dim). pooling is the model's own Sentence Transformers mode:
+    lasttoken (Harrier, Qwen3), cls (bge) or mean (MiniLM)."""
     vectors = np.zeros((len(texts), dim), np.float32)
     # Similar lengths together, so short chunks don't get padded up to the longest one in the batch.
     order = np.argsort([len(t) for t in texts])
@@ -60,7 +73,12 @@ def encode_last_token(session: ort.InferenceSession, tokenizer, texts: list[str]
                            return_tensors="np")
         mask = tokens["attention_mask"].astype(np.int64)
         hidden = session.run(None, {"input_ids": tokens["input_ids"].astype(np.int64), "attention_mask": mask})[0]
-        last = mask.shape[1] - 1 - np.argmax(mask[:, ::-1], axis=1)  # last real token, whichever side is padded
-        pooled = hidden[np.arange(len(batch)), last]
+        if pooling == "lasttoken":
+            last = mask.shape[1] - 1 - np.argmax(mask[:, ::-1], axis=1)  # last real token, whichever side is padded
+            pooled = hidden[np.arange(len(batch)), last]
+        elif pooling == "cls":
+            pooled = hidden[:, 0]
+        else:  # mean over real tokens
+            pooled = (hidden * mask[:, :, None]).sum(1) / mask.sum(1, keepdims=True)
         vectors[batch] = pooled / np.linalg.norm(pooled, axis=1, keepdims=True)
     return vectors

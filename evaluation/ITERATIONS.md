@@ -83,3 +83,47 @@ Base model: Qwen3 for 1–11, Harrier from 12. "Team" = held-out Hit@1 change; b
    document's first lines into metadata (used as a filter or tie-breaker) fits the semantic-only goal.
 4. Clean labels: list duplicate copies and companion files as secondary relevant files.
 5. Speed: rerank 15 chunks instead of 30, or an ONNX/quantized reranker, if 0.4 s is too slow on target hardware.
+
+# Indexing speed (Nov 11, 2026)
+
+Goal: index a folder in 5–10 minutes on a laptop without a GPU, keeping Harrier 270M's accuracy (final pipeline:
+team 0.642, OrgSmith 0.823, sample 0.957 Hit@1). Measured on an M5 Pro (CPU = 5 threads); other laptops will differ.
+Profiler: `python -m evaluation.index_bench`. Accuracy check: `python -m evaluation.lab --speed` (a shortcut passes if
+team and OrgSmith Hit@1 drop at most 1 point and the sample loses at most 1 query).
+
+## Result: team corpus (280 files), CPU, whole index including extraction
+| Setup | Chunks embedded | Whole index | 90% of files searchable |
+|---|---|---|---|
+| Harrier 270M as it loaded before (bfloat16, PyTorch) | 26,298 | ~4.5 h (1.6 chunks/s) | — |
+| + float32 | 26,298 | ~24 min (18 chunks/s) | — |
+| + ONNX Runtime | 26,298 | ~15 min (31 chunks/s) | — |
+| **+ files capped at 100 chunks, smallest first (`refinder/indexer.py`)** | **5,709** | **3.9 min** | **2.7 min** |
+| bge-small, same indexer | 5,617 | 2.0 min | 1.1 min |
+
+The last two rows are real end-to-end runs of `index_files` (offline); the others are extrapolated from 2,000 chunks.
+On the Mac GPU the full 26,298 chunks take about 3.5 min with Harrier 270M and 9–10 min with Qwen3-0.6B.
+
+## Where the time goes
+- Embedding dominates. Uncached extraction takes 1.2 min (PDFs 55 s, one 19 s; one spreadsheet 15 s), chunking 2 s.
+  With the cap, extraction is now about a quarter of Harrier's time and half of bge-small's.
+- 5 files (textbook PDFs, a spreadsheet) hold 72% of the team corpus's chunks; the median file has 12.
+
+## Experiments
+| Change | Chunks | Accuracy (team / OrgSmith / sample Hit@1) | Decision |
+|---|---|---|---|
+| **Cap files at 200 / 100 / 50 evenly spaced chunks** | 24% / 22% / 19% | +0.5 / +0.6 / +1.4 pts team (within noise); OrgSmith and sample unchanged (no file that big) | **keep 100** |
+| Chunk overlap 25 instead of 50 | 92% | 0.0 / −1.2 / +2 queries | revert |
+| Chunk overlap 0 | 94% | −1.1 / −1.0 / +3 queries | revert |
+| ONNX Runtime on CPU (float32) | — | identical vectors (cosine 1.0000) | **keep**: Harrier 270M 1.7x, bge-small and MiniLM ~10% |
+| ONNX int8 | — | vectors 0.99 cosine, OrgSmith −2 / sample −3 queries (Harrier 270M, embeddings only) | revert: no faster on Apple silicon; `index_bench --int8` to retest on Intel/AMD |
+| Batch size 16–32 instead of 64–128 | — | identical | **keep** (`MAX_BATCH = 32`): 5–15% faster on CPU and GPU |
+| Static model `minishlab/potion-retrieval-32M` | — | final pipeline 0.544 / 0.759 / 0.930 (bge-small 0.582 / 0.811 / 0.939) | not adopted: ~26,000 chunks/s on CPU, so a possible "instant first pass" later |
+| Pruning / distilling Harrier | — | not tried | needs retraining; the cap gave more for far less |
+
+## Notes
+- The cap's cost shows up in the 24 team queries aimed at a file over 100 chunks: Hit@1 0.917 → 0.833 (2 queries).
+  A query for a detail deep inside a textbook can miss; the file-level queries we have mostly don't.
+- A capped file keeps its full chunk count (`IndexedFile.n_chunks`) for the size penalty.
+- Parth's ~90 min with Qwen on a GPU isn't explained by this Mac (about 10 min). Running
+  `python -m evaluation.index_bench --models Qwen/Qwen3-Embedding-0.6B --limit-chunks 2000` on his machine will show
+  which stage is slow.

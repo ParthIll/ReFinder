@@ -31,8 +31,13 @@ MODEL_PROMPTS = {
 # Models whose architecture code lives in the model repo rather than in transformers.
 REMOTE_CODE_MODELS = {"nomic-ai/nomic-embed-text-v1.5", "Snowflake/snowflake-arctic-embed-m-v2.0"}
 
-# Models that run through ONNX Runtime on CPU: float32 ONNX matched PyTorch's vectors at about 1.7x the speed.
-ONNX_MODELS = {"microsoft/harrier-oss-v1-270m"}
+# Models that run through ONNX Runtime on CPU. float32 ONNX matched PyTorch's vectors (cosine 1.0000) and was faster
+# on an M5 Pro: Harrier 270M 18 -> 30 chunks/s, bge-small 92 -> 101, MiniLM 180 -> 196.
+ONNX_MODELS = {"microsoft/harrier-oss-v1-270m", "BAAI/bge-small-en-v1.5", "sentence-transformers/all-MiniLM-L6-v2"}
+
+# Larger batches were slower on both CPU and GPU (Harrier 270M on MPS: 131 chunks/s at 16, 119 at 128), and use more
+# memory, so callers asking for more get batches of this size.
+MAX_BATCH = 32
 
 
 def pick_device() -> str:
@@ -70,10 +75,16 @@ class Embedder:
             if not self.model.prompts.get(kind):
                 self.model.prompts[kind] = prompt
         self.onnx_session = None
+        # The ONNX path reproduces the model's pooling itself, so it needs to know which one (and that the prompt
+        # tokens count toward it, as they do for every model listed in ONNX_MODELS).
+        pooling = next((m for m in self.model if type(m).__name__ == "Pooling"), None)
+        self.pooling_mode = getattr(pooling, "pooling_mode", None) if getattr(pooling, "include_prompt", False) else None
         if device == "cpu" and model_name in ONNX_MODELS:
             try:
-                from refinder.onnx_encoder import load_session
+                from refinder.onnx_encoder import POOLING, load_session
 
+                if self.pooling_mode not in POOLING:
+                    raise ValueError(f"pooling {self.pooling_mode!r} not supported")
                 self.onnx_session = load_session(model_name, self.tokenizer)
             except Exception as e:  # missing package or failed export: PyTorch gives the same vectors, just slower
                 print(f"  ONNX unavailable ({type(e).__name__}: {e}); using PyTorch")
@@ -160,18 +171,18 @@ class Embedder:
     def _encode(self, fn, texts: list[str], batch_size: int, show_progress: bool) -> np.ndarray:
         return fn(
             texts,
-            batch_size=batch_size,
+            batch_size=min(batch_size, MAX_BATCH),
             normalize_embeddings=True,
             convert_to_numpy=True,
             show_progress_bar=show_progress,
         ).astype(np.float32)
 
     def _encode_onnx(self, texts: list[str], prompt_kind: str, batch_size: int, show_progress: bool) -> np.ndarray:
-        from refinder.onnx_encoder import encode_last_token
+        from refinder.onnx_encoder import encode
 
         prompt = self.model.prompts.get(prompt_kind) or ""
-        return encode_last_token(self.onnx_session, self.tokenizer, [prompt + t for t in texts], self.dim,
-                                 self.max_seq_length, batch_size, show_progress)
+        return encode(self.onnx_session, self.tokenizer, [prompt + t for t in texts], self.dim, self.max_seq_length,
+                      min(batch_size, MAX_BATCH), self.pooling_mode, show_progress)
 
     def encode(self, texts: list[str], batch_size: int = 64, show_progress: bool = False) -> np.ndarray:
         """Encode document-side texts to L2-normalized float32 vectors, shape (n, dim). Dot product == cosine.
