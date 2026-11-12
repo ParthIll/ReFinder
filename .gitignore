@@ -17,6 +17,3 @@ chroma_db/
 
 # Downloaded test corpora (evaluation/orgsmith.py)
 datasets/
-
-# PyInstaller work files
-build/

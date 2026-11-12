@@ -17,9 +17,7 @@ CHUNKING = ("window", "paragraph")
 
 
 def chunk_corpus(
-    embedder: Embedder, texts: list[str], pieces: list[list[str]] | None = None, chunking: str = "window",
-    overlap: int = CHUNK_OVERLAP,
-    max_chunks: int = 0,
+    embedder: Embedder, texts: list[str], pieces: list[list[str]] | None = None, chunking: str = "window"
 ) -> tuple[list[str], np.ndarray, np.ndarray]:
     """Returns (chunk texts, owning file per chunk, (first_piece, last_piece) per chunk; -1 for window chunks).
 
@@ -33,24 +31,14 @@ def chunk_corpus(
     chunk_texts, owner, spans = [], [], []
     for doc_id, text in enumerate(texts):
         if chunking == "paragraph":
-            chunks = embedder.chunk_pieces(pieces[doc_id], CHUNK_TOKENS, overlap)
+            chunks = embedder.chunk_pieces(pieces[doc_id], CHUNK_TOKENS, CHUNK_OVERLAP)
         else:
-            chunks = embedder.chunk(text, CHUNK_TOKENS, overlap)
-        if max_chunks and len(chunks) > max_chunks:
-            chunks = [chunks[i] for i in sample_chunks(len(chunks), max_chunks)]
+            chunks = embedder.chunk(text, CHUNK_TOKENS, CHUNK_OVERLAP)
         for c in chunks:
             chunk_texts.append(c.text)
             owner.append(doc_id)
             spans.append((-1, -1) if c.first_piece is None else (c.first_piece, c.last_piece))
     return chunk_texts, np.array(owner, dtype=int), np.array(spans, dtype=int).reshape(-1, 2)
-
-
-def sample_chunks(n: int, cap: int) -> list[int]:
-    """Which of a file's n chunks to embed when only `cap` fit: the opening half of the budget (titles,
-    abstracts, intros say what a file is about), then the rest spread evenly over the remainder."""
-    head = cap // 2
-    tail = np.linspace(head, n - 1, cap - head).round().astype(int)
-    return sorted(set(range(head)) | set(tail.tolist()))
 
 
 def embed_corpus(
@@ -59,15 +47,12 @@ def embed_corpus(
     use_cache: bool = True,
     pieces: list[list[str]] | None = None,
     chunking: str = "window",
-    overlap: int = CHUNK_OVERLAP,
-    max_chunks: int = 0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
     """Chunk + embed every file, caching on disk keyed by model, chunking settings and corpus content.
 
     Returns (vectors, owning file per chunk, piece span per chunk, stats).
     """
-    h = hashlib.sha256(f"{embedder.cache_id}|{chunking}|{CHUNK_TOKENS}|{overlap}".encode()
-                       + (f"|cap{max_chunks}".encode() if max_chunks else b""))
+    h = hashlib.sha256(f"{embedder.model_name}|{chunking}|{CHUNK_TOKENS}|{CHUNK_OVERLAP}".encode())
     for i, t in enumerate(texts):
         h.update(t.encode())
         if chunking == "paragraph":
@@ -78,7 +63,7 @@ def embed_corpus(
         return z["vecs"], z["owner"], z["spans"], {"cached": True}
 
     t0 = time.perf_counter()
-    chunk_texts, owner, spans = chunk_corpus(embedder, texts, pieces, chunking, overlap, max_chunks)
+    chunk_texts, owner, spans = chunk_corpus(embedder, texts, pieces, chunking)
     t_chunk = time.perf_counter() - t0
     print(f"  {len(chunk_texts):,} {chunking} chunks from {len(texts):,} files; embedding...")
     t0 = time.perf_counter()

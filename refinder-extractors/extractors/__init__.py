@@ -6,7 +6,6 @@ from .excel import extract_xlsx
 from .powerpoint import extract_pptx
 from .pdf import extract_pdf
 from .text import extract_text, extract_delimited
-from .ocr import IMAGE_SUFFIXES, extract_image
 
 EXTRACTORS = {
     ".docx": extract_docx,
@@ -18,7 +17,6 @@ EXTRACTORS = {
     ".markdown": extract_text,
     ".csv": extract_delimited,
     ".tsv": extract_delimited,
-    **{suffix: extract_image for suffix in IMAGE_SUFFIXES},
 }
 
 

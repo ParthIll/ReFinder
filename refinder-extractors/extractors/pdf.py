@@ -1,10 +1,8 @@
-"""PDF: paragraph-like chunks, each prefixed with page number. Images on each page (including scanned pages with no
-text layer) are OCR'd into "Page N Image K" chunks."""
+"""PDF: paragraph-like chunks, each prefixed with page number; OCR not included."""
 import re
 from pathlib import Path
 from pypdf import PdfReader
 from ..normalize import normalize_text, split_paragraphs
-from .ocr import ocr_embedded
 
 
 def _page_paragraphs(text: str) -> list[str]:
@@ -31,41 +29,15 @@ def _page_paragraphs(text: str) -> list[str]:
     return paragraphs
 
 
-def _page_image_texts(page, seen: set[str], on_visual=None, page_number: int = 1) -> list[tuple[int, str]]:
-    """OCR text of each image on a page. Skips images that can't be decoded (some PDF image formats aren't
-    supported by Pillow) rather than failing the whole file."""
-    try:
-        images = list(page.images)
-    except Exception:  # pypdf raises on some broken image streams
-        return []
-
-    texts = []
-    for image_number, image in enumerate(images, 1):
-        try:
-            decoded = image.image
-        except Exception:
-            continue
-        if decoded is None:
-            continue
-        fallback = (lambda img, info, i=image_number: on_visual(img, {"page": page_number, "image": i}, info)) if on_visual else None
-        text = ocr_embedded(decoded, seen, on_fallback=fallback)
-        if text:
-            texts.append((image_number, text))
-    return texts
-
-
-def extract_pdf(path: Path, on_visual=None) -> list[str]:
+def extract_pdf(path: Path) -> list[str]:
     reader = PdfReader(path)
     if reader.is_encrypted:
         if reader.decrypt("") == 0:
             raise ValueError("Encrypted PDF requires a password")
     chunks = []
-    seen_images: set[str] = set()
     for page_number, page in enumerate(reader.pages, 1):
         text = page.extract_text() or ""
-        for paragraph_number, paragraph in enumerate(_page_paragraphs(text), 1):
+        for paragraph_number,paragraph in enumerate(_page_paragraphs(text),1):
             if paragraph:
                 chunks.append(f"Page {page_number} Paragraph {paragraph_number}\n{paragraph}")
-        for image_number, image_text in _page_image_texts(page, seen_images, on_visual, page_number):
-            chunks.append(f"Page {page_number} Image {image_number}\n{image_text}")
     return chunks

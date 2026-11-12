@@ -26,7 +26,6 @@ MODEL_PROMPTS = {
     "nomic-ai/nomic-embed-text-v1.5": {"query": "search_query: ", "document": "search_document: "},
     "microsoft/harrier-oss-v1-270m": _HARRIER_QUERY,
     "microsoft/harrier-oss-v1-0.6b": _HARRIER_QUERY,
-    "intfloat/multilingual-e5-small": {"query": "query: ", "document": "passage: "},
 }
 
 # Models whose architecture code lives in the model repo rather than in transformers.
@@ -53,38 +52,17 @@ class Chunk:
 
 
 class Embedder:
-    def __init__(self, model_name: str = DEFAULT_MODEL, device: str | None = None, fp16: bool = False):
+    def __init__(self, model_name: str = DEFAULT_MODEL, device: str | None = None):
         self.model_name = model_name
         self.model = SentenceTransformer(model_name, device=device or pick_device(),
                                          trust_remote_code=model_name in REMOTE_CODE_MODELS)
-        # Half precision roughly halves the work per chunk on a GPU; CPUs gain nothing, so stay in fp32 there.
-        self.fp16 = fp16 and self.model.device.type != "cpu"
-        if self.fp16:
-            self.model.half()
-        # Identifies what produced a vector, for caches: fp16 vectors differ slightly from fp32 ones.
-        self.cache_id = model_name + ("|fp16" if self.fp16 else "")
-        self.tokenizer = self._chunking_tokenizer(self.model.tokenizer)
+        self.tokenizer = self.model.tokenizer
         self.dim = self.model.get_embedding_dimension()
         # all-MiniLM-L6-v2 truncates at 256 word pieces; chunks must stay under that.
         self.max_seq_length = self.model.max_seq_length
         for kind, prompt in MODEL_PROMPTS.get(model_name, {}).items():
             if not self.model.prompts.get(kind):
                 self.model.prompts[kind] = prompt
-
-    @staticmethod
-    def _chunking_tokenizer(tok):
-        """A transformers-style tokenizer for chunking. Static-embedding models ship a bare `tokenizers.Tokenizer`
-        (often set to truncate), so wrap an untruncated copy of it."""
-        from transformers import PreTrainedTokenizerBase, PreTrainedTokenizerFast
-
-        if isinstance(tok, PreTrainedTokenizerBase):
-            return tok
-        from tokenizers import Tokenizer
-
-        copy = Tokenizer.from_str(tok.to_str())
-        copy.no_truncation()
-        copy.no_padding()
-        return PreTrainedTokenizerFast(tokenizer_object=copy)
 
     def chunk(self, text: str, chunk_tokens: int = CHUNK_TOKENS, overlap: int = CHUNK_OVERLAP) -> list[Chunk]:
         """Split text into ~chunk_tokens-token windows that overlap by `overlap` tokens."""
