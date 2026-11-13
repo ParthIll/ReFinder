@@ -220,6 +220,27 @@ most 1 point under Harrier, indexing at least 3x faster.
 - `MongoDB/mdbr-leaf-ir-asym` was not tested: it encodes documents with the 109M teacher, so indexing gets slower.
 - Added to the registry as `leaf-ir` ("Fast + accurate"). The app's default model is unchanged.
 
+**Outside check (BEIR, Nov 13; model alone, best chunk per document, no app extras), nDCG@10:**
+
+| Model | SciFact | NFCorpus |
+|---|---|---|
+| mdbr-leaf-ir | 0.698 | 0.359 |
+| Harrier 270M | 0.716 | 0.365 |
+| bge-small | 0.725 | 0.345 |
+| BM25 | 0.686 | 0.321 |
+
+With the app's reranker (gte, top 30, fused by rank; `beir --rerank Alibaba-NLP/gte-reranker-modernbert-base`):
+
+| Model + reranker | SciFact | NFCorpus |
+|---|---|---|
+| mdbr-leaf-ir | 0.749 | 0.380 |
+| Harrier 270M | 0.753 | 0.383 |
+
+On public data mdbr-leaf-ir is 1.8 / 0.6 points under Harrier 270M alone and 0.4 / 0.3 under it with the reranker,
+so "about as accurate", not better: its lead on our three sets (picked among 7 models on those same sets) is within
+selection noise. The ~8x indexing speed holds
+either way. Stronger check still open: fresh blind queries for files that have none (Next steps, item 2).
+
 ## Chunk only what's kept (Nov 13, 2026)
 Before embedding, the app chunked every file whole and then kept 20-50 chunks per file: on Andrew's 14,224-file index,
 706,967 chunks made to keep ~46,000 (120 s with mdbr-leaf-ir's tokenizer, the "understanding 0%" wait).
@@ -236,3 +257,10 @@ size penalty is estimated too (median estimate/true 0.99 for mdbr-leaf-ir, 0.85 
 Kept (rule: no set drops more than 1 point). Stop + resume still gives identical vectors. Chunking on 4 threads
 (own tokenizer copy each) gave 8.3 → 6.9 s, and 4-8 worker processes were slower than one (start-up), so neither
 was kept: the tokenizer already uses several cores.
+
+## Keyword index: each distinct text once (Nov 13, 2026)
+`_set_keyword` tokenized, stemmed and word-counted every copy of a duplicated file again (32% of the characters of
+Andrew's 14k-file index are in copies), and counted words in a second pass over the phrase strings. It now does each
+distinct text once and gives copies the same result. Output is identical (vocab, phrase strings, word counts in the
+same order, filter tables, BM25 scores for 50 queries; mdbr-leaf-ir Hit@1 0.652 / 0.623 / 0.870 unchanged).
+Time on the 14k index: 12.3 -> 9.8 s (3 runs each). Runs on every Replace all, Add folder and backend start.

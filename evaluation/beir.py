@@ -76,6 +76,24 @@ def bm25_rankings(texts: list[str], queries: list[str]) -> tuple[np.ndarray, dic
     return ranked, {"index_s": t_index, "query_ms": 1000 * t_query / len(queries)}
 
 
+def rerank(ranked: np.ndarray, texts: list[str], queries: list[str], model: str, depth: int = 30) -> np.ndarray:
+    """The app's reranking: a cross-encoder scores each query's top `depth` documents, and its order is fused with the
+    first-stage order by reciprocal rank (k=60, equal weights). Documents below `depth` keep their place."""
+    from sentence_transformers import CrossEncoder
+
+    from refinder.embedder import pick_device
+
+    ce = CrossEncoder(model, device=pick_device())
+    out = ranked.copy()
+    for i, (q, docs) in enumerate(zip(queries, ranked)):
+        top = docs[:depth]
+        ce_order = np.argsort(-ce.predict([(q, texts[d]) for d in top], batch_size=32, show_progress_bar=False))
+        fused = 1 / (60 + 1 + np.arange(len(top)))  # first-stage rank
+        fused[ce_order] += 1 / (60 + 1 + np.arange(len(top)))  # reranker rank
+        out[i, :len(top)] = top[np.argsort(-fused, kind="stable")]
+    return out
+
+
 def evaluate(ranked: np.ndarray, qrels: list[dict[int, int]]) -> dict[str, float]:
     """nDCG@10 (linear gain, as in trec_eval/BEIR), Recall@10/100, MRR@10, averaged over queries."""
     ndcg, r10, r100, mrr = [], [], [], []
@@ -98,6 +116,9 @@ def main() -> None:
     ap.add_argument("--datasets", nargs="+", default=list(DATASETS), choices=DATASETS)
     ap.add_argument("--models", nargs="+", default=[DEFAULT_MODEL])
     ap.add_argument("--no-bm25", action="store_true")
+    ap.add_argument("--rerank", default=None, metavar="CROSS_ENCODER",
+                    help="also score each model with this reranker on its top 30, fused by rank as in the app "
+                         "(e.g. Alibaba-NLP/gte-reranker-modernbert-base)")
     args = ap.parse_args()
 
     results, stats = {}, {}
@@ -109,6 +130,8 @@ def main() -> None:
         for model in args.models:
             scores, stats[ds][model] = dense_scores(model, texts, queries)
             results[ds][model] = evaluate(top_k(scores), qrels)
+            if args.rerank:
+                results[ds][f"{model} + rerank"] = evaluate(rerank(top_k(scores), texts, queries, args.rerank), qrels)
         if not args.no_bm25:
             ranked, stats[ds]["bm25"] = bm25_rankings(texts, queries)
             results[ds]["bm25"] = evaluate(ranked, qrels)

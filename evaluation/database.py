@@ -267,7 +267,16 @@ class ChromaIndex:
     def _set_keyword(self, manifest: dict[str, Any]) -> None:
         """Build BM25 and the filename/filter tables over every file in the manifest (paths are absolute)."""
         texts = ["\n\n".join(ps) for ps in manifest["pieces"]]
-        tokenized = self._tokenize(texts)
+        # Copied files share one text (32% of the characters of a 14k-file home folder): tokenize and count each
+        # distinct text once and give every copy the same result. The index is identical, built faster.
+        uniq = list(dict.fromkeys(texts))
+        where = {t: i for i, t in enumerate(uniq)}
+        idx = [where[t] for t in texts]
+        tok = self._tokenize(uniq)
+        tokenized = bm25s.tokenization.Tokenized(ids=[tok.ids[i] for i in idx], vocab=tok.vocab)
+        uniq_words = [_words(t) for t in uniq]
+        flat_u = [" ".join(ws) for ws in uniq_words]
+        copies = Counter(idx)
         bm25 = bm25s.BM25()
         bm25.index(tokenized, show_progress=False)
         roots = manifest["roots"]
@@ -279,7 +288,7 @@ class ChromaIndex:
             "file_words": [set(f) for f, _ in names],
             "folder_words": [set(d) for _, d in names],
             "name_vocab": sorted({w for f, d in names for w in f + d}),
-            "flat": [" ".join(_words(t)) for t in texts],  # for exact-phrase checks
+            "flat": [flat_u[i] for i in idx],  # for exact-phrase checks
         }
         # Dates and sizes are read fresh (cheap: a few ms per thousand files) rather than stored in the manifest.
         meta = np.array([file_meta(p) for p in manifest["paths"]], dtype=np.float64).reshape(-1, 3)
@@ -287,7 +296,10 @@ class ChromaIndex:
         keyword["type"] = np.array([file_type(p) for p in manifest["paths"]])
         keyword["folder"] = [str(Path(p).parent).lower() for p in manifest["paths"]]
         # Unstemmed words in file text with their counts, for "Did you mean" suggestions.
-        freq = Counter(w for f in keyword["flat"] for w in f.split() if len(w) >= 3 and not w.isdigit())
+        freq = Counter()
+        for i, ws in enumerate(uniq_words):
+            for w, n in Counter(w for w in ws if len(w) >= 3 and not w.isdigit()).items():
+                freq[w] += n * copies[i]
         keyword["word_freq"] = freq
         keyword["words"] = list(freq)
         with self.lock:
