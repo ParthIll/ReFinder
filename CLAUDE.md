@@ -78,7 +78,10 @@ ML/benchmark work (ONNX, indexing speed); `andrew-model-picker` = `testing-envir
   (`_dense_ranking_plus`); other models use Parth's dense ranking unchanged. The Settings dialog has the picker.
   `python -m evaluation.api_eval` scores every model through this real search code (ITERATIONS.md, "Models inside
   the app's search": Harrier 270M team 0.600 vs bge-small 0.552 Hit@1; the filename/folder bonus costs OrgSmith
-  ~18 pts for every model; duplicates count as hits).
+  ~18 pts for every model; duplicates count as hits). `ModelSpec.w_kw` is each model's BM25 weight in the fusion
+  (Harrier 270M 0.25: team 0.633; others 1; `api_eval --w-kw` sweeps it). `/search` then starts each meaning
+  match's snippet at the chunk sentence closest to the query (`_best_sentence_snippets` in server.py; `passage`
+  is unchanged).
   `/preview`, `/raw`, `/thumbnail`, `/open` (evaluation/preview.py) serve the app's file viewer and open/reveal
   actions, only for indexed paths; the frontend renders PDFs with pdf.js and DOCX with docx-preview (`Preview.tsx`),
   PPTX as Quick Look HTML (macOS, `/quicklook/{key}/`), and highlights each result's `passage` by word overlap

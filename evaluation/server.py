@@ -17,7 +17,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse as RawFileResponse
 from pydantic import BaseModel
 
-from evaluation.database import Cancelled, ChromaIndex, Filters
+import numpy as np
+
+from evaluation.database import SNIPPET_CHARS, Cancelled, ChromaIndex, Filters
 from refinder import models
 
 # Process start-up costs a few seconds, so small folders extract in-process.
@@ -283,7 +285,34 @@ def search(
         enc = _get_embedder()
         with model_lock:
             query_vec = enc.encode_query(q)
-    return SearchResponse(results=[SearchResult(**hit) for hit in store.search(q, query_vec, k=k, filters=filters)])
+    hits = store.search(q, query_vec, k=k, filters=filters)
+    if query_vec is not None:
+        _best_sentence_snippets(hits, query_vec, enc)
+    return SearchResponse(results=[SearchResult(**hit) for hit in hits])
+
+
+# A sentence ends at . ! ? plus a space, except after a title or initial ("Dr. Patel", "J. Smith").
+SENTENCE_END = re.compile(r"(?<=[.!?])(?<!\b[A-Z][a-z]\.)(?<!\b[A-Z]\.)\s+")
+SNIPPET_SENTENCES = 16  # sentences scored per result
+
+
+def _best_sentence_snippets(hits: list[dict[str, Any]], query_vec: np.ndarray, enc: Any) -> None:
+    """Start each meaning match's snippet at the sentence of its chunk closest to the query, so the line that
+    answers the search shows instead of the chunk's opening. Literal matches keep their keyword snippet."""
+    starts = {i: [0] + [m.end() for m in SENTENCE_END.finditer(h["passage"])][:SNIPPET_SENTENCES - 1]
+              for i, h in enumerate(hits) if h["chunk_id"] is not None}
+    starts = {i: s for i, s in starts.items() if len(s) > 1}
+    flat = [hits[i]["passage"][a:b] for i, s in starts.items() for a, b in zip(s, s[1:] + [None])]
+    if not flat:
+        return
+    with model_lock:
+        sims = enc.encode(flat) @ query_vec
+    pos = 0
+    for i, s in starts.items():
+        best = int(np.argmax(sims[pos:pos + len(s)]))
+        pos += len(s)
+        if best:
+            hits[i]["snippet"] = ("…" + hits[i]["passage"][s[best]:])[:SNIPPET_CHARS]
 
 
 @app.get("/status", response_model=StatusResponse)
