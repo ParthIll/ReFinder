@@ -384,12 +384,19 @@ class ChromaIndex:
         n_docs = len(self.manifest["paths"])
         self.embedded_chunks, self.total_chunks = done_chunks, done_chunks + len(chunk_texts)
         paths = self.manifest["paths"]
+        # Copied files and shared boilerplate repeat chunk texts (32% of a 14k-file Downloads folder): embed each
+        # once and reuse its vector. Only repeated texts are kept in memory.
+        repeated = {t for t, c in Counter(chunk_texts).items() if c > 1}
+        seen: dict[str, np.ndarray] = {}
         for start in range(0, len(chunk_texts), EMBED_BATCH):
             if generation != self.generation:
                 raise Cancelled
             batch = chunk_texts[start:start + EMBED_BATCH]
+            new = list(dict.fromkeys(t for t in batch if t not in seen))
             with model_lock:
-                vecs = embedder.encode(batch, batch_size=64)
+                fresh = dict(zip(new, embedder.encode(new, batch_size=64))) if new else {}
+            vecs = np.stack([fresh[t] if t in fresh else seen[t] for t in batch])
+            seen.update((t, v) for t, v in fresh.items() if t in repeated)
             end = start + len(batch)
             if spec.file_vector:
                 for i, v in zip(owner[start:end], vecs):

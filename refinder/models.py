@@ -31,7 +31,8 @@ MODELS: dict[str, ModelSpec] = {m.key: m for m in (
               max_chunks=20, sampling="head"),
     ModelSpec("harrier-270m", "microsoft/harrier-oss-v1-270m", "Accurate",
               "Harrier 270M + reranker: best results without a GPU (about 4 min for 280 files on CPU)",
-              max_chunks=100, sampling="even", file_vector=True, reranker="Alibaba-NLP/gte-reranker-modernbert-base",
+              max_chunks=50,  # 100 -> 50: same Hit@1 (team +0.3 pts), 47% fewer chunks on a 14k-file folder
+              sampling="even", file_vector=True, reranker="Alibaba-NLP/gte-reranker-modernbert-base",
               w_kw=0.25,  # team Hit@1 0.598 -> 0.633, OrgSmith and sample within 1 point (ITERATIONS.md)
               fp16=False),  # Harrier (Gemma 3) gives NaN vectors in fp16; it runs in its own bfloat16 on a GPU
     ModelSpec("harrier-0.6b", "microsoft/harrier-oss-v1-0.6b", "Most accurate",

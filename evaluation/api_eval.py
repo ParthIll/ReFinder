@@ -9,6 +9,7 @@ for the models that have them. Each test set is indexed into a throwaway Chroma 
 """
 
 import argparse
+import dataclasses
 import tempfile
 import threading
 import time
@@ -59,12 +60,15 @@ def main():
     ap.add_argument("--device", default=None, help="cpu, mps or cuda (default: best available)")
     ap.add_argument("--w-kw", nargs="+", type=float, default=None,
                     help="BM25 weights to compare in the fusion (default: each model's own w_kw)")
+    ap.add_argument("--max-chunks", type=int, default=None, help="override each model's chunks per file")
     args = ap.parse_args()
     dsets = lab.load_datasets()
     work = Path(tempfile.mkdtemp(prefix="refinder_api_eval_"))
     print(f"{len(dsets)} test sets; throwaway indexes in {work}")
     for key in args.models:
         spec = models.MODELS[key]
+        if args.max_chunks is not None:  # ChromaIndex looks the spec up by key, so replace it in the registry
+            spec = models.MODELS[key] = dataclasses.replace(spec, max_chunks=args.max_chunks)
         embedder = Embedder(spec.name, device=args.device, fp16=spec.fp16)
         w_kws = args.w_kw or [spec.w_kw]
         out = {ds["name"]: evaluate(spec, ds, embedder, work, w_kws) for ds in dsets}

@@ -120,6 +120,21 @@ On the Mac GPU the full 26,298 chunks take about 3.5 min with Harrier 270M and 9
 | Static model `minishlab/potion-retrieval-32M` | — | final pipeline 0.544 / 0.759 / 0.930 (bge-small 0.582 / 0.811 / 0.939) | not adopted: ~26,000 chunks/s on CPU, so a possible "instant first pass" later |
 | Pruning / distilling Harrier | — | not tried | needs retraining; the cap gave more for far less |
 
+### Fewer chunks in the app (Nov 12, `api_eval`, app's real search, Harrier 270M)
+Andrew's 14,223-file Downloads index, real chunker: 84,725 chunks at the 100 cap, of which 32% repeat another
+chunk's text exactly (copied files, shared boilerplate); 233 files at the cap hold 31%.
+
+| Change | Chunks embedded (14k folder) | Accuracy (team / OrgSmith / sample Hit@1) | Decision |
+|---|---|---|---|
+| Embed each repeated chunk text once (`ChromaIndex.embed`), all models | 84,725 → 57,714 | identical for Harrier 270M and bge-small; stop + resume gives identical vectors | **keep** |
+| Cap 50 instead of 100 (w_kw 0.25) | 57,714 → 44,795 | 0.633 → 0.636 / 0.621 = / 0.861 = | **keep** for Harrier 270M |
+| Spreadsheets (csv/tsv/xlsx) capped at 10 | 44,795 → 38,539 | within 1 pt (w_kw 1) | not adopted: test-set spreadsheets are tiny (removed 95 chunks), so untested on big CSVs |
+
+Total: 84,725 → 44,795 chunks (−47%), roughly 11 → 6 min of embedding on the M5 Pro GPU (~130 chunks/s) and
+47 → 25 min on its CPU (~30 chunks/s); estimates from chunk counts, since the timed runs shared the GPU with other
+jobs. The repeated-text check costs ~4 ms per 85,000 chunks, so folders without copies lose nothing.
+`api_eval --max-chunks N` overrides the cap.
+
 ## Notes
 - The cap's cost shows up in the 24 team queries aimed at a file over 100 chunks: Hit@1 0.917 → 0.833 (2 queries).
   A query for a detail deep inside a textbook can miss; the file-level queries we have mostly don't.
