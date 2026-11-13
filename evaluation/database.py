@@ -115,8 +115,7 @@ COLLECTION_NAME = "refinder"
 FILES_COLLECTION = "refinder_files"  # one whole-file mean vector per file, for models with file_vector
 DEFAULT_PERSIST_DIR = Path(__file__).resolve().parent / "chroma_db"
 MANIFEST_NAME = "manifest.json"
-EMBED_BATCH = 256  # chunks per encode + Chroma add; also how often embedding checks for cancellation
-# Chunks embedded per file come from the model's spec (refinder/models.py; bge-small: first 10 + 10 spread over the
+EMBED_BATCH = 256  # chunks per encode + Chroma add; also how often embedding checks for cancellation# Chunks embedded per file come from the model's spec (refinder/models.py; bge-small: first 10 + 10 spread over the
 # rest). BM25 always sees the full text.
 RRF_K = 60  # reciprocal rank fusion constant; a file scores sum(1 / (RRF_K + rank)) over the lists it appears in
 DENSE_CANDIDATES = 400  # nearest chunks fetched from Chroma per query
@@ -359,24 +358,19 @@ class ChromaIndex:
               on_progress: Callable[[int, int], None] | None = None) -> None:
         """Stage 2: embed capped paragraph chunks of files not embedded yet (ids >= embedded_docs) into Chroma.
         Raises Cancelled if the index changed meanwhile. `model_lock` serializes model use with query encoding."""
-        from evaluation.common import chunk_corpus
-
         spec = self.spec()
         first = self.embedded_docs
         with self.lock:  # drop chunks of a file that was half done when a previous embed stopped
             self.collection.delete(where={"doc_id": {"$gte": first}})
             self.files.delete(where={"doc_id": {"$gte": first}})
             done_chunks = self.count()
-        pieces = self.manifest["pieces"][first:]
-        texts = self.texts[first:]
-        chunk_texts, owner, _ = chunk_corpus(embedder, texts, pieces, "paragraph")
+        # Each file's kept chunks, and its full chunk count (for the size penalty; estimated for long files).
+        chunk_texts, owner, n_full = [], [], {}
+        for d, ps in enumerate(self.manifest["pieces"][first:], start=first):
+            kept, n_full[d] = embedder.chunk_pieces_capped(ps, spec.max_chunks, spec.sampling)
+            chunk_texts += [c.text for c in kept]
+            owner += [d] * len(kept)
         owner = np.asarray(owner, dtype=int)
-        n_full = np.bincount(owner, minlength=len(texts))  # each file's real chunk count, for the size penalty
-        starts = np.r_[0, np.cumsum(n_full)[:-1]]
-        keep = [int(s) + i for s, n in zip(starts, n_full) for i in models.sample_chunks(int(n), spec.max_chunks,
-                                                                                          spec.sampling)]
-        chunk_texts, owner = [chunk_texts[i] for i in keep], owner[keep] + first
-        n_full = {first + d: int(n) for d, n in enumerate(n_full)}
         sums: dict[int, np.ndarray] = {}  # running sum of each file's chunk vectors (file_vector models)
         ordinal = np.zeros(len(owner), dtype=int)  # chunk position within its file (after capping)
         for i in range(1, len(owner)):

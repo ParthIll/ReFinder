@@ -219,3 +219,20 @@ most 1 point under Harrier, indexing at least 3x faster.
 - Search through `/search` (sample corpus, GPU, reranker and sentence snippets included): 0.36–0.49 s.
 - `MongoDB/mdbr-leaf-ir-asym` was not tested: it encodes documents with the 109M teacher, so indexing gets slower.
 - Added to the registry as `leaf-ir` ("Fast + accurate"). The app's default model is unchanged.
+
+## Chunk only what's kept (Nov 13, 2026)
+Before embedding, the app chunked every file whole and then kept 20-50 chunks per file: on Andrew's 14,224-file index,
+706,967 chunks made to keep ~46,000 (120 s with mdbr-leaf-ir's tokenizer, the "understanding 0%" wait).
+`Embedder.chunk_pieces_capped` chunks files up to 3x the cap exactly as before (13,800 of 14,224 files), and longer
+files only around the kept positions, estimated from length (`CHARS_PER_CHUNK = 450`); their chunk count for the
+size penalty is estimated too (median estimate/true 0.99 for mdbr-leaf-ir, 0.85 for Harrier).
+
+| Model | Chunking, 14k index | Team | OrgSmith | Sample (Hit@1, before → after) |
+|---|---|---|---|---|
+| mdbr-leaf-ir | 120 s → 8 s | 0.653 → 0.652 | 0.623 = | 0.870 = |
+| Harrier 270M | 89 s → 10 s | 0.636 → 0.633 | 0.621 = | 0.861 = |
+| bge-small | — | 0.552 → 0.548 | 0.609 = | 0.878 = |
+
+Kept (rule: no set drops more than 1 point). Stop + resume still gives identical vectors. Chunking on 4 threads
+(own tokenizer copy each) gave 8.3 → 6.9 s, and 4-8 worker processes were slower than one (start-up), so neither
+was kept: the tokenizer already uses several cores.

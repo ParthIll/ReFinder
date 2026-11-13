@@ -13,6 +13,9 @@ hf_logging.set_verbosity_error()
 DEFAULT_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 CHUNK_TOKENS = 200
 CHUNK_OVERLAP = 50
+# Characters per paragraph chunk of a long file (median over the test sets' big files: 455 for the bge / mdbr-leaf-ir
+# tokenizer, 489 for Harrier's). Used to find a long file's kept chunks without chunking all of it.
+CHARS_PER_CHUNK = 450
 
 # Query/document prefixes recommended by the model authors but missing from the model's own config. Models that
 # ship their prompts (e.g. Qwen3-Embedding, arctic-embed) don't need an entry.
@@ -189,6 +192,35 @@ class Embedder:
             buf.append((i, pieces[i], n))
         flush(carry=False)
         return chunks
+
+    def chunk_pieces_capped(self, pieces: list[str], cap: int, how: str = "head") -> tuple[list[Chunk], int]:
+        """The chunks a file keeps when at most `cap` are embedded (chunk_pieces + models.sample_chunks), and its
+        chunk count. A long file is chunked only around the kept positions, estimated from its length, so a textbook
+        costs about as much as a short note; its chunk count is then an estimate too. Files up to 3x the cap are
+        chunked whole, exactly as before."""
+        from refinder.models import sample_chunks
+
+        n_chars = sum(map(len, pieces))
+        est = -(-n_chars // CHARS_PER_CHUNK)
+        if not cap or est <= 3 * cap:
+            chunks = self.chunk_pieces(pieces)
+            return [chunks[i] for i in sample_chunks(len(chunks), cap, how)], len(chunks)
+        starts = np.cumsum([0] + [len(p) for p in pieces])  # character offset where each piece begins
+        keep = sample_chunks(est, cap, how)
+        runs = np.split(keep, np.where(np.diff(keep) > 1)[0] + 1)  # consecutive positions share one window
+        out: list[Chunk] = []
+        for run in runs:
+            lo = int(run[0]) * n_chars // est
+            budget = int((len(run) + 1) * CHARS_PER_CHUNK * 1.5)  # enough text for the run's chunks, with margin
+            i = int(np.searchsorted(starts, lo, side="right")) - 1
+            # Start at the piece containing `lo` (at its beginning, unless it alone is longer than the window).
+            window = [pieces[i] if len(pieces[i]) <= budget else pieces[i][lo - starts[i]:]]
+            while sum(map(len, window)) < budget and i + 1 < len(pieces):
+                i += 1
+                window.append(pieces[i])
+            window[-1] = window[-1][:max(1, budget - sum(map(len, window[:-1])))]  # a giant last piece is cut
+            out += self.chunk_pieces(window)[:len(run)]
+        return out, est
 
     def _encode(self, fn, texts: list[str], batch_size: int, show_progress: bool) -> np.ndarray:
         return fn(
