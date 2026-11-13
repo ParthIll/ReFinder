@@ -47,7 +47,7 @@ ML/benchmark work (ONNX, indexing speed); `andrew-model-picker` = `testing-envir
   MiniLM) run through `refinder/onnx_encoder.py`, which exports to `.cache/onnx/` on first use, reproduces the
   model's pooling (last-token, CLS or mean) and falls back to PyTorch on failure. `MAX_BATCH = 32` (bigger was slower).
 - `refinder/models.py` — registry of the embedding models the app offers (`MODELS`, keyed `bge-small`, `harrier-270m`,
-  `harrier-0.6b`, `minilm`). Each `ModelSpec` carries its chunk budget per file (`max_chunks` + `sampling`
+  `harrier-0.6b`, `minilm`, `leaf-ir`). `leaf-ir` (MongoDB/mdbr-leaf-ir, 23M) + the search extras beat Harrier 270M on every test set and indexes ~8x faster (ITERATIONS.md, "Fast models with the search extras"). Each `ModelSpec` carries its chunk budget per file (`max_chunks` + `sampling`
   head/even), `fp16` (off for Harrier: NaN in fp16), and whether search adds the whole-file vector and a reranker.
   `sample_chunks` is the one chunk sampler. To add a model, add a spec (and its prompts in `MODEL_PROMPTS`).
 - `refinder/indexer.py` — the ML half of indexing, no storage: `index_files(paths, embedder)` yields per file its

@@ -41,6 +41,13 @@ MODELS: dict[str, ModelSpec] = {m.key: m for m in (
               gpu_recommended=True, fp16=False),
     ModelSpec("minilm", "sentence-transformers/all-MiniLM-L6-v2", "Lightweight",
               "MiniLM: smallest model, least accurate", max_chunks=20, sampling="head"),
+    # 23M model distilled from snowflake-arctic-embed-m-v1.5. With Harrier's search extras it beat Harrier 270M on
+    # every test set (team 0.653 / OrgSmith 0.623 / sample 0.870 vs 0.636 / 0.621 / 0.861) and embeds ~8x faster
+    # (M5 Pro: 750 vs 90 chunks/s on GPU, 187 vs 22 on CPU). Its Dense layer keeps it on PyTorch, not ONNX.
+    ModelSpec("leaf-ir", "MongoDB/mdbr-leaf-ir", "Fast + accurate",
+              "mdbr-leaf-ir + reranker: about 8x faster to index than Harrier 270M, as accurate",
+              max_chunks=20, sampling="head", file_vector=True, reranker="Alibaba-NLP/gte-reranker-modernbert-base",
+              w_kw=0.25),  # team 0.653; 0.1 to 1 all within 1.3 pts of it
 )}
 DEFAULT_MODEL = "bge-small"
 

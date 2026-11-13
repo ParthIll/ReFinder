@@ -192,3 +192,30 @@ Rule: best team Hit@1 losing at most 1 point on OrgSmith and 1 sample query. 0.2
 Keywords still help a little: 0 is below 0.25 on every set. Only Harrier 270M was swept; Harrier 0.6B, bge-small
 and MiniLM keep 1. (w_kw 1 gives 0.598 here vs 0.600 above: run-to-run GPU noise.) Idea from scry
 (github.com/xxx12e/scry), which weights meaning 0.7 / keywords 0.3.
+
+# Fast models with the search extras (Nov 12, 2026)
+
+Question: can a small model index much faster than Harrier 270M and stay as accurate? `api_eval --extras` gives any
+model Harrier's search extras (whole-file vector + size penalty + gte reranker fused by rank); every model was swept
+over BM25 weights 1 / 0.5 / 0.25 / 0.1 / 0, through the app's real search, 20 chunks per file (first half + spread)
+unless noted. Rule: team Hit@1 >= 0.606 (at most 3 points under Harrier, agreed with Andrew), OrgSmith and sample at
+most 1 point under Harrier, indexing at least 3x faster.
+
+| Model (params) + extras, best weight | Team | OrgSmith | Sample | GPU chunks/s | CPU chunks/s | Result |
+|---|---|---|---|---|---|---|
+| Harrier 270M, 50/file, 0.25 (before) | 0.636 | 0.621 | 0.861 | 90 | 22 (ONNX) | baseline |
+| **MongoDB/mdbr-leaf-ir (23M), 0.25** | **0.653** | **0.623** | **0.870** | **750** | **187** | **pass: better on all three, ~8x faster** |
+| Snowflake/snowflake-arctic-embed-s (33M), 0.5 | 0.627 | 0.632 | 0.878 | 434 | 95 | pass |
+| ibm-granite/granite-embedding-small-english-r2 (47M), 0.5 | 0.617 | 0.609 | 0.870 | — | — | borderline (OrgSmith −1.2) |
+| bge-small (33M), 0.1 | 0.594 | 0.601 | 0.887 | — | — | fail |
+| MiniLM (22M), 0.25 | 0.598 | 0.613 | 0.878 | — | — | fail (team) |
+| potion-retrieval-32M (static), 1 | 0.555 | 0.625 | 0.896 | — | — | fail (team) |
+
+- mdbr-leaf-ir passes at every BM25 weight (team 0.642–0.655), so the choice of 0.25 isn't what makes it win.
+- Speeds: `index_bench --limit-chunks 2000`, M5 Pro, nothing else running. mdbr-leaf-ir has a Dense projection, so
+  it runs on PyTorch on CPU (the ONNX path only reproduces pooling); 187 chunks/s is without ONNX.
+- On Andrew's 14k-file Downloads folder: ~31,600 chunks to embed (20/file, repeated text once) vs 44,795 for
+  Harrier, so about 40 s vs 8 min on the GPU and 3 min vs 35 min on the CPU (estimates from chunk counts).
+- Search through `/search` (sample corpus, GPU, reranker and sentence snippets included): 0.36–0.49 s.
+- `MongoDB/mdbr-leaf-ir-asym` was not tested: it encodes documents with the 109M teacher, so indexing gets slower.
+- Added to the registry as `leaf-ir` ("Fast + accurate"). The app's default model is unchanged.

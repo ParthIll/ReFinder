@@ -61,6 +61,8 @@ def main():
     ap.add_argument("--w-kw", nargs="+", type=float, default=None,
                     help="BM25 weights to compare in the fusion (default: each model's own w_kw)")
     ap.add_argument("--max-chunks", type=int, default=None, help="override each model's chunks per file")
+    ap.add_argument("--extras", action="store_true",
+                    help="give every model Harrier's search extras: whole-file vector + gte reranker")
     args = ap.parse_args()
     dsets = lab.load_datasets()
     work = Path(tempfile.mkdtemp(prefix="refinder_api_eval_"))
@@ -69,6 +71,9 @@ def main():
         spec = models.MODELS[key]
         if args.max_chunks is not None:  # ChromaIndex looks the spec up by key, so replace it in the registry
             spec = models.MODELS[key] = dataclasses.replace(spec, max_chunks=args.max_chunks)
+        if args.extras:
+            spec = models.MODELS[key] = dataclasses.replace(spec, file_vector=True,
+                                                            reranker=models.MODELS["harrier-270m"].reranker)
         embedder = Embedder(spec.name, device=args.device, fp16=spec.fp16)
         w_kws = args.w_kw or [spec.w_kw]
         out = {ds["name"]: evaluate(spec, ds, embedder, work, w_kws) for ds in dsets}
